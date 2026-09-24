@@ -41,8 +41,11 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 | --- | --- | --- | --- |
 | `mai-protocol` | lib | 探针与应用之间的消息类型（serde），协议版本常量 | serde |
 | `mai-probe` | bin | 远程探针：serve、hook、emit 等子命令 | mai-protocol, sysinfo |
-| `mai-core` | lib | 连接、部署、状态机、配置 | russh（ring）,russh-sftp,ssh2-config,keyring |
+| `mai-core` | lib | 连接、部署、状态机、配置 | 见下方 |
 | `mai-app` | bin | Tauri 外壳：暴露 mai-core，承载前端 | mai-core, tauri |
+
+mai-core dependencies: mai-protocol, russh (ring), russh-sftp, ssh2-config,
+keyring, tokio, sha2, serde
 
 前端代码位于 `mai-app/ui/`（TypeScript + xterm.js）。
 
