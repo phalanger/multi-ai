@@ -89,6 +89,17 @@ fn stable_without_match_emits_nothing() {
 }
 
 #[test]
+fn working_re_emitted_after_stable_unmatched_period() {
+    let (r, mut t) = (rules(), ScrapeTracker::default());
+    t.observe(&r, "fake", &pane(), "a", 0);
+    let got = t.observe(&r, "fake", &pane(), "b", 1_000);
+    assert_eq!(got, Some(AgentState::Working));
+    assert_eq!(t.observe(&r, "fake", &pane(), "b", 7_000), None);
+    let got = t.observe(&r, "fake", &pane(), "c", 8_000);
+    assert_eq!(got, Some(AgentState::Working));
+}
+
+#[test]
 fn unknown_agent_returns_none() {
     let (r, mut t) = (rules(), ScrapeTracker::default());
     t.observe(&r, "nope", &pane(), "a", 0);

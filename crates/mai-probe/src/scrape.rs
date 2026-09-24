@@ -124,6 +124,7 @@ impl ScrapeTracker {
         } else if any_match(&rule.done, screen) {
             AgentState::Done
         } else {
+            p.emitted = None;
             return None;
         };
         if p.emitted == Some(next) {
