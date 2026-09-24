@@ -1,0 +1,11 @@
+[package]
+name = "mai-probe"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mai-protocol = { workspace = true }
+regex = { workspace = true }
+
+[lints]
+workspace = true
