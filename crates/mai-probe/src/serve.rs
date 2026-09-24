@@ -59,6 +59,7 @@ pub struct Server<Z> {
     panes: BTreeMap<String, Vec<PaneInfo>>,
     /// Panes known to run an agent (from hooks or identification).
     agents: HashMap<PaneRef, String>,
+    spool_failing: bool,
 }
 
 impl<Z: Zellij> Server<Z> {
@@ -77,6 +78,7 @@ impl<Z: Zellij> Server<Z> {
             sessions: Vec::new(),
             panes: BTreeMap::new(),
             agents: HashMap::new(),
+            spool_failing: false,
         })
     }
 
@@ -105,8 +107,15 @@ impl<Z: Zellij> Server<Z> {
     fn drain_spool(&mut self, out: &mut Vec<ProbeMsg>) {
         let read = match self.spool.read_after(self.read_cursor) {
             Ok(r) => r,
-            Err(e) => return out.push(error("spool_read", e)),
+            Err(e) => {
+                if !self.spool_failing {
+                    out.push(error("spool_read", e));
+                    self.spool_failing = true;
+                }
+                return;
+            }
         };
+        self.spool_failing = false;
         self.read_cursor = read.end_cursor;
         if read.bad_lines > 0 {
             out.push(error(
@@ -119,7 +128,9 @@ impl<Z: Zellij> Server<Z> {
                 session: rec.session,
                 pane_id: rec.pane_id,
             };
-            self.agents.insert(pane.clone(), rec.agent.clone());
+            if self.zellij.is_some() {
+                self.agents.insert(pane.clone(), rec.agent.clone());
+            }
             if let Some(m) = map_hook(&rec.agent, &rec.payload) {
                 out.push(ProbeMsg::AgentEvent(AgentEvent {
                     pane,
@@ -176,11 +187,15 @@ impl<Z: Zellij> Server<Z> {
                         session: session.clone(),
                         pane_id: p.id,
                     };
-                    self.agents.remove(&gone);
                     self.scrape.forget(&gone);
                 }
             }
         }
+        self.agents.retain(|k, _| {
+            fresh
+                .get(&k.session)
+                .is_some_and(|ps| ps.iter().any(|p| p.id == k.pane_id))
+        });
         self.panes = fresh;
     }
 

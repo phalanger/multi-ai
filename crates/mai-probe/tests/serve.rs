@@ -405,3 +405,55 @@ fn without_zellij_only_spool_events_flow() {
     .collect::<Vec<_>>();
     assert_eq!(codes, vec!["zellij_missing"]);
 }
+
+#[test]
+fn spool_read_error_is_reported_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("spool");
+    std::fs::write(&p, b"x").unwrap();
+    let mut s = Server::new(Some(Fake::default()), Spool::new(&p), &default_rules()).unwrap();
+    let out1 = s.tick(0);
+    let out2 = s.tick(10);
+    let codes: Vec<&str> = error_codes(&out1)
+        .into_iter()
+        .chain(error_codes(&out2))
+        .collect();
+    let spool_read_count = codes.iter().filter(|c| *c == &"spool_read").count();
+    assert_eq!(
+        spool_read_count, 1,
+        "spool_read error should appear exactly once"
+    );
+}
+
+#[test]
+fn hook_pane_missing_from_poll_is_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    Spool::new(dir.path()).append(&stop_record(1, 5)).unwrap();
+    let fake = Fake::default();
+    {
+        let mut st = fake.0.borrow_mut();
+        st.sessions = vec![session("work")];
+        st.panes.insert("work".into(), vec![]);
+        st.screens.insert(5, fixture("claude-idle"));
+    }
+    let mut s = server(&fake, dir.path());
+    let out1 = s.tick(0);
+    assert!(
+        !events(&out1).is_empty(),
+        "first tick should have hook event"
+    );
+
+    fake.0.borrow_mut().panes.insert(
+        "work".into(),
+        vec![pane(5, "C:\\WINDOWS\\system32\\cmd.exe")],
+    );
+    let out2 = s.tick(3_000);
+    let ev = events(&out2);
+    let scrape_unknown = ev.iter().any(|e| {
+        e.state == AgentState::Unknown && e.source == EventSource::Scrape && e.pane.pane_id == 5
+    });
+    assert!(
+        scrape_unknown,
+        "stale hook entry should be pruned, pane identified afresh by screen"
+    );
+}
