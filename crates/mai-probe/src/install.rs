@@ -159,24 +159,57 @@ fn read_doc(path: &Path) -> Result<Value, InstallError> {
     }
 }
 
+/// Most symlink hops followed when resolving a config path.
+const MAX_LINKS: usize = 16;
+
+/// File that a write to `path` must replace: the final symlink target
+/// when `path` is a symlink (so the link itself survives), else `path`.
+/// A relative link target is taken relative to the link's directory.
+fn write_target(path: &Path) -> io::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match fs::symlink_metadata(&target) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let link = fs::read_link(&target)?;
+                target = match target.parent() {
+                    Some(dir) if link.is_relative() => dir.join(link),
+                    _ => link,
+                };
+            }
+            _ => return Ok(target),
+        }
+    }
+    Err(io::Error::other("too many levels of symbolic links"))
+}
+
 /// Back up the existing file (if any) as `<name>.mai-bak-<ms>`, then
-/// write `doc` via a temp file + rename.
+/// write `doc` via a temp file + rename. A symlinked config is written
+/// through to its target, and the target's permissions are kept.
 fn write_doc(path: &Path, doc: &Value, now_ms: u64) -> Result<(), InstallError> {
     let io_err = |e| InstallError::Io(path.into(), e);
-    if path.exists() {
-        let mut bak = path.as_os_str().to_owned();
+    let target = write_target(path).map_err(io_err)?;
+    let perms = match fs::metadata(&target) {
+        Ok(m) => Some(m.permissions()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io_err(e)),
+    };
+    if perms.is_some() {
+        let mut bak = target.as_os_str().to_owned();
         bak.push(format!(".mai-bak-{now_ms}"));
-        fs::copy(path, PathBuf::from(bak)).map_err(io_err)?;
-    } else if let Some(dir) = path.parent() {
+        fs::copy(&target, PathBuf::from(bak)).map_err(io_err)?;
+    } else if let Some(dir) = target.parent() {
         fs::create_dir_all(dir).map_err(io_err)?;
     }
-    let mut tmp = path.as_os_str().to_owned();
+    let mut tmp = target.as_os_str().to_owned();
     tmp.push(".mai-tmp");
     let tmp = PathBuf::from(tmp);
     let mut text = serde_json::to_string_pretty(doc).expect("Value serializes");
     text.push('\n');
     fs::write(&tmp, text).map_err(io_err)?;
-    fs::rename(&tmp, path).map_err(io_err)
+    if let Some(perms) = perms {
+        fs::set_permissions(&tmp, perms).map_err(io_err)?;
+    }
+    fs::rename(&tmp, &target).map_err(io_err)
 }
 
 fn apply(

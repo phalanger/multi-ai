@@ -141,6 +141,40 @@ fn uninstall_restores_user_content() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn install_writes_through_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("settings.json"), r#"{"model": "opus"}"#).unwrap();
+    let link = dir.path().join("settings.json");
+    std::os::unix::fs::symlink("real/settings.json", &link).unwrap();
+    assert_eq!(
+        install_file(&link, CLAUDE_EVENTS, &cmd(), 1).unwrap(),
+        Outcome::Installed
+    );
+    let meta = std::fs::symlink_metadata(&link).unwrap();
+    assert!(meta.file_type().is_symlink());
+    let doc = read(&real.join("settings.json"));
+    assert_eq!(doc["model"], "opus");
+    assert_eq!(doc["hooks"]["Stop"][0]["hooks"][0]["command"], cmd());
+    assert!(real.join("settings.json.mai-bak-1").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn install_keeps_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, "{}").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    install_file(&path, CLAUDE_EVENTS, &cmd(), 1).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
 #[test]
 fn probe_exe_must_be_absolute_and_under_mai_bin() {
     let good = if cfg!(windows) {
