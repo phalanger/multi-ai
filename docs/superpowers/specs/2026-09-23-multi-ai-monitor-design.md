@@ -108,11 +108,15 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 
 | 子命令 | 调用方 | 作用 |
 | --- | --- | --- |
-| `serve [--zellij <path>]` | 应用经 ProbeConn 启动 | 随 channel 存活，经 stdio 通信 |
+| `serve [--zellij <path>] [--rules <file>]` | 应用启动 | 随 channel 存活，经 stdio 通信 |
 | `hook <agent>` | Claude Code / Codex hooks | 事件名取自载荷，写 spool 即返回 |
 | `emit --agent <name> --state <s> [--msg <m>]` | cmagent 及其他 agent | 通用上报接口 |
 | `install-hooks` / `uninstall-hooks` | 应用在部署后调用 | 合并式修改 agent 配置 |
 | `--version` | 应用部署时 | 输出版本与构建哈希 |
+
+hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因此 `install-hooks`
+要求探针从 `.mai/bin` 下的绝对路径运行；否则每个 agent 输出 `outcome` 为 `error`
+的结果行，不写入任何文件，退出码为 1。
 
 ### 4.2 部署流程
 
@@ -139,7 +143,8 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 - `~/.codex/hooks.json`：与 Claude 相同的合并方式追加带 `mai` 标识的条目。
   不使用 `notify`：它会被 Codex 内部轮次（如生成标题）触发，产生误报。
   Codex 的非托管 hooks 需用户信任后才运行（在 Codex 中执行 `/hooks`）；
-  安装后应用提示用户完成信任，具体检测方式在 02-probe 中确定。
+  探针无法检测 Codex 是否已信任这些 hooks；`install-hooks` 对 Codex 的结果行带有
+  `note` 字段，提示用户在 Codex 中执行 `/hooks`，由应用展示该提示。
 - `uninstall-hooks` 仅移除带 `mai` 标识的条目。
 - 解析失败（配置文件格式异常）时不写入，返回错误，由应用提示用户。
 
