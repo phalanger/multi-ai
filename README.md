@@ -11,7 +11,7 @@ Design: `docs/superpowers/specs/2026-09-23-multi-ai-monitor-design.md`
 | --- | --- |
 | `mai-protocol` | probe/app wire messages (JSON Lines) |
 | `mai-core` | UI-independent core: agent state tracking and alerts |
-| `mai-probe` | remote probe; currently the screen-scrape classifier |
+| `mai-probe` | remote probe: hooks, spool, zellij polling, scrape, metrics |
 
 ## Development
 
@@ -19,3 +19,21 @@ Design: `docs/superpowers/specs/2026-09-23-multi-ai-monitor-design.md`
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## mai-probe
+
+```bash
+mai-probe serve [--zellij PATH] [--rules FILE]   # JSON Lines on stdin/stdout
+mai-probe hook <agent>                           # called by agent hooks
+mai-probe emit --agent A --state S [--msg M]     # report state from any agent
+mai-probe install-hooks | uninstall-hooks
+```
+
+`install-hooks` requires the probe to run from `~/.mai/bin` (absolute
+path): hook entries are recognised by that path, so it refuses otherwise
+and writes nothing. `install-hooks` / `uninstall-hooks` print one JSON
+line per agent (`claude`, `codex`) with `outcome`
+`installed|removed|unchanged|skipped|error`.
+
+Data dir: `$MAI_HOME`, default `~/.mai` (spool in `spool/`).
+Default scrape rules: `crates/mai-probe/rules/default.toml`.

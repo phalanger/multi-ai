@@ -1,0 +1,66 @@
+▎ before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+  1 more notice hidden
+
+❯ Count from 1 to 40, one number per line, no tools.
+
+● 1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+  10
+  11
+  12
+  13
+  14
+  15
+  16
+  17
+  18
+  19
+  20
+  21
+  22
+  23
+  24
+  25
+  26
+  27
+  28
+  29
+  30
+  31
+  32
+  33
+  34
+  35
+  36
+  37
+  38
+  39
+  40
+
+✻ Cooked for 3s · done 19:48
+
+❯ Run this shell command: echo hi > x.txt
+
+  Writing "hi" to x.txt
+  ⎿  $ echo hi > x.txt
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+
+   echo hi > x.txt
+   Write "hi" to x.txt
+ Do you want to proceed?
+ ❯ 1. Yes   2. Yes, and always allow access to G:\work\ai\multi-ai\spikes\claude-playground from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend

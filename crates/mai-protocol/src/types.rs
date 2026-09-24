@@ -98,6 +98,10 @@ pub struct AgentRule {
     pub needs_input_patterns: Vec<String>,
     #[serde(default)]
     pub done_patterns: Vec<String>,
+    /// Text matching these is removed from the screen before hashing and
+    /// state matching (status-line clocks, idle animations).
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
     /// Screen must be unchanged this long before idle states are inferred.
     pub stable_ms: u64,
 }

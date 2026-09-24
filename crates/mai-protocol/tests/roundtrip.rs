@@ -100,6 +100,7 @@ fn app_messages_roundtrip() {
                 screen_patterns: vec![],
                 needs_input_patterns: vec!["y/n".into()],
                 done_patterns: vec![],
+                ignore_patterns: vec![],
                 stable_ms: 5000,
             }],
         },

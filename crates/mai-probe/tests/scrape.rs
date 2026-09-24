@@ -9,6 +9,7 @@ fn rules() -> CompiledRules {
             screen_patterns: vec![r"FAKE AGENT v\d".into()],
             needs_input_patterns: vec![r"(?m)^Allow\? \[y/n\]".into()],
             done_patterns: vec![r"(?m)^> $".into()],
+            ignore_patterns: vec![],
             stable_ms: 5_000,
         }],
     })
@@ -16,7 +17,10 @@ fn rules() -> CompiledRules {
 }
 
 fn pane() -> PaneRef {
-    PaneRef { session: "work".into(), pane_id: 1 }
+    PaneRef {
+        session: "work".into(),
+        pane_id: 1,
+    }
 }
 
 const ASK: &str = "FAKE AGENT v1\nrun rm?\nAllow? [y/n]\n";
@@ -27,7 +31,10 @@ fn identify_by_title_command_or_screen() {
     let r = rules();
     assert_eq!(r.identify("fakeagent - x", None, ""), Some("fake"));
     assert_eq!(r.identify("bash", Some("fakeagent --x"), ""), Some("fake"));
-    assert_eq!(r.identify("bash", None, "FAKE AGENT v2 ready"), Some("fake"));
+    assert_eq!(
+        r.identify("bash", None, "FAKE AGENT v2 ready"),
+        Some("fake")
+    );
     assert_eq!(r.identify("bash", None, "$ ls"), None);
 }
 
@@ -40,6 +47,7 @@ fn compile_rejects_bad_regex() {
             screen_patterns: vec![],
             needs_input_patterns: vec![],
             done_patterns: vec![],
+            ignore_patterns: vec![],
             stable_ms: 1,
         }],
     };
