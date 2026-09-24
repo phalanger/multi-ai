@@ -15,6 +15,9 @@ use crate::scrape::{CompiledRules, RuleError, ScrapeTracker};
 use crate::spool::Spool;
 use crate::zellij::Zellij;
 
+/// Shortest interval `AppMsg::SetInterval` may set (one run-loop tick).
+pub const MIN_INTERVAL_MS: u64 = 250;
+
 /// Polling intervals; changed by `AppMsg::SetInterval`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Intervals {
@@ -310,9 +313,9 @@ impl<Z: Zellij> Server<Z> {
                 metrics_ms,
             } => {
                 self.intervals = Intervals {
-                    pane_poll_ms,
-                    scrape_ms,
-                    metrics_ms,
+                    pane_poll_ms: pane_poll_ms.max(MIN_INTERVAL_MS),
+                    scrape_ms: scrape_ms.max(MIN_INTERVAL_MS),
+                    metrics_ms: metrics_ms.max(MIN_INTERVAL_MS),
                 };
                 Vec::new()
             }

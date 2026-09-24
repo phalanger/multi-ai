@@ -29,5 +29,11 @@ mai-probe emit --agent A --state S [--msg M]     # report state from any agent
 mai-probe install-hooks | uninstall-hooks
 ```
 
+`install-hooks` requires the probe to run from `~/.mai/bin` (absolute
+path): hook entries are recognised by that path, so it refuses otherwise
+and writes nothing. `install-hooks` / `uninstall-hooks` print one JSON
+line per agent (`claude`, `codex`) with `outcome`
+`installed|removed|unchanged|skipped|error`.
+
 Data dir: `$MAI_HOME`, default `~/.mai` (spool in `spool/`).
 Default scrape rules: `crates/mai-probe/rules/default.toml`.

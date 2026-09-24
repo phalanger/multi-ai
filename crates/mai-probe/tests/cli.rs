@@ -87,6 +87,23 @@ fn hook_usage_error_never_blocks_the_agent() {
 }
 
 #[test]
+fn serve_with_missing_explicit_zellij_reports_null_path() {
+    let home = tempfile::tempdir().unwrap();
+    let missing = home.path().join("no-zellij");
+    let out = probe(
+        home.path(),
+        &["serve", "--zellij", missing.to_str().unwrap()],
+        "",
+        false,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let hello: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(hello["type"], "hello", "{text}");
+    assert_eq!(hello["zellij_path"], Value::Null, "{text}");
+}
+
+#[test]
 fn emit_rejects_unknown_state() {
     let home = tempfile::tempdir().unwrap();
     let out = probe(

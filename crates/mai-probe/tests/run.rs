@@ -47,6 +47,25 @@ fn run_sends_hello_answers_input_and_stops_at_eof() {
 }
 
 #[test]
+fn non_utf8_line_is_reported_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    let server: Server<CliZellij> =
+        Server::new(None, Spool::new(dir.path()), &default_rules()).unwrap();
+    let mut out = Vec::new();
+    run(server, hello(), Cursor::new(vec![0xff, b'\n']), &mut out).unwrap();
+    let msgs: Vec<ProbeMsg> = String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .map(|l| decode_line(l).unwrap())
+        .collect();
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, ProbeMsg::Error { code, .. } if code == "bad_message")),
+        "{msgs:?}"
+    );
+}
+
+#[test]
 fn metrics_sample_is_plausible() {
     let mut m = MetricsSampler::new();
     m.sample(1_000);

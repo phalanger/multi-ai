@@ -17,7 +17,10 @@ fn rules() -> CompiledRules {
 }
 
 fn pane() -> PaneRef {
-    PaneRef { session: "work".into(), pane_id: 1 }
+    PaneRef {
+        session: "work".into(),
+        pane_id: 1,
+    }
 }
 
 const ASK: &str = "FAKE AGENT v1\nrun rm?\nAllow? [y/n]\n";
@@ -28,7 +31,10 @@ fn identify_by_title_command_or_screen() {
     let r = rules();
     assert_eq!(r.identify("fakeagent - x", None, ""), Some("fake"));
     assert_eq!(r.identify("bash", Some("fakeagent --x"), ""), Some("fake"));
-    assert_eq!(r.identify("bash", None, "FAKE AGENT v2 ready"), Some("fake"));
+    assert_eq!(
+        r.identify("bash", None, "FAKE AGENT v2 ready"),
+        Some("fake")
+    );
     assert_eq!(r.identify("bash", None, "$ ls"), None);
 }
 

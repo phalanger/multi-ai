@@ -80,6 +80,33 @@ fn remove_drops_only_ours_and_empty_events() {
 }
 
 #[test]
+fn group_shared_with_user_hook_keeps_user_hook() {
+    let linter = json!({"type": "command", "command": "my-linter"});
+    let mixed = json!({"hooks": {"Stop": [{"hooks": [
+        {"type": "command", "command": cmd()},
+        linter.clone(),
+    ]}]}});
+
+    let mut doc = mixed.clone();
+    remove_hooks(&mut doc).unwrap();
+    assert_eq!(
+        doc,
+        json!({"hooks": {"Stop": [{"hooks": [linter.clone()]}]}})
+    );
+
+    let mut doc = mixed;
+    merge_hooks(&mut doc, CLAUDE_EVENTS, &cmd()).unwrap();
+    let inner: Vec<&Value> = doc["hooks"]["Stop"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["hooks"].as_array().unwrap())
+        .collect();
+    assert_eq!(inner.iter().filter(|h| h["command"] == cmd()).count(), 1);
+    assert_eq!(inner.iter().filter(|h| **h == &linter).count(), 1);
+}
+
+#[test]
 fn install_creates_file_then_reports_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".codex").join("hooks.json");

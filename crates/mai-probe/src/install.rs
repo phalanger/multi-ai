@@ -63,6 +63,17 @@ pub enum Outcome {
     Unchanged,
 }
 
+impl Outcome {
+    /// Name used in `install-hooks` / `uninstall-hooks` output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Removed => "removed",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
 /// Hook command for `agent`, e.g. `"C:/Users/x/.mai/bin/mai-probe.exe" hook claude`.
 /// Backslashes are normalised to `/` so `MARKER` matches on every OS.
 pub fn hook_command(probe_exe: &Path, agent: &str) -> String {
@@ -84,17 +95,24 @@ pub fn check_probe_exe(exe: &Path) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn is_ours(entry: &Value) -> bool {
-    entry
-        .get("hooks")
-        .and_then(Value::as_array)
-        .is_some_and(|hs| {
-            hs.iter().any(|h| {
-                h.get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains(MARKER))
-            })
-        })
+fn is_ours(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|c| c.contains(MARKER))
+}
+
+/// Remove our hook objects from every group of one event's list. A group
+/// is dropped only when that leaves its `hooks` array empty, so a user
+/// hook sharing a group with ours survives.
+fn strip_ours(list: &mut Vec<Value>) {
+    list.retain_mut(|group| {
+        let Some(hs) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let before = hs.len();
+        hs.retain(|h| !is_ours(h));
+        hs.len() == before || !hs.is_empty()
+    });
 }
 
 fn hooks_table(doc: &mut Value) -> Result<&mut Map<String, Value>, &'static str> {
@@ -120,7 +138,7 @@ pub fn merge_hooks(
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or("a hook event is not a JSON array")?;
-        list.retain(|e| !is_ours(e));
+        strip_ours(list);
         let mut entry = json!({"hooks": [{"type": "command", "command": command}]});
         if *with_matcher {
             entry["matcher"] = json!("*");
@@ -130,7 +148,7 @@ pub fn merge_hooks(
     Ok(())
 }
 
-/// Remove our entries; drop event keys that become empty.
+/// Remove our hooks; drop groups and event keys that become empty.
 pub fn remove_hooks(doc: &mut Value) -> Result<(), &'static str> {
     let Some(root) = doc.as_object_mut() else {
         return Err("top level is not a JSON object");
@@ -143,7 +161,7 @@ pub fn remove_hooks(doc: &mut Value) -> Result<(), &'static str> {
         .ok_or("\"hooks\" is not a JSON object")?;
     for list in hooks.values_mut() {
         if let Some(list) = list.as_array_mut() {
-            list.retain(|e| !is_ours(e));
+            strip_ours(list);
         }
     }
     hooks.retain(|_, list| list.as_array().is_none_or(|l| !l.is_empty()));

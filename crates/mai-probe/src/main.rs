@@ -17,7 +17,7 @@ use mai_probe::install::{
 use mai_probe::rules::{default_rules, parse_rules};
 use mai_probe::run::{now_ms, run};
 use mai_probe::serve::Server;
-use mai_probe::spool::{Spool, SpoolRecord};
+use mai_probe::spool::{Spool, SpoolRecord, spool_dir};
 use mai_probe::zellij::{CliZellij, find_via_login_shell, find_zellij};
 use mai_protocol::{AgentState, PROTOCOL_VERSION, ProbeMsg};
 use serde_json::{Value, json};
@@ -74,7 +74,7 @@ fn home_dir() -> PathBuf {
 /// Probe data dir: `$MAI_HOME` if set, else `<home>/.mai`.
 fn spool(home: &Path) -> Spool {
     let mai = env::var_os("MAI_HOME").map_or_else(|| home.join(".mai"), PathBuf::from);
-    Spool::new(mai.join("spool"))
+    Spool::new(spool_dir(&mai))
 }
 
 /// Spool record for the zellij pane this process runs in, if any.
@@ -170,7 +170,7 @@ fn cmd_hooks(home: &Path, install: bool) -> ExitCode {
                 Ok(outcome) => {
                     let mut line = json!({
                         "agent": agent,
-                        "outcome": format!("{outcome:?}").to_lowercase(),
+                        "outcome": outcome.as_str(),
                         "path": path.display().to_string(),
                     });
                     if install && agent == "codex" && outcome != Outcome::Unchanged {
@@ -202,8 +202,10 @@ fn cmd_serve(home: &Path, zellij: Option<PathBuf>, rules: Option<PathBuf>) -> io
             io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", p.display()))
         })?,
     };
+    // An explicit `--zellij` that does not exist is reported as missing,
+    // not replaced by whatever the login shell finds.
     let exe = find_zellij(zellij.as_deref(), env::var_os("PATH").as_deref(), home).or_else(|| {
-        let shell = env::var_os("SHELL").filter(|_| !cfg!(windows))?;
+        let shell = env::var_os("SHELL").filter(|_| !cfg!(windows) && zellij.is_none())?;
         find_via_login_shell(&shell)
     });
     let cli = exe.clone().map(CliZellij::new);

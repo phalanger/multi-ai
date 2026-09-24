@@ -402,9 +402,28 @@ fn bad_line_is_reported_and_next_line_works() {
     assert_eq!(
         s.intervals(),
         Intervals {
-            pane_poll_ms: 1,
-            scrape_ms: 2,
-            metrics_ms: 3
+            pane_poll_ms: 250,
+            scrape_ms: 250,
+            metrics_ms: 250
+        }
+    );
+}
+
+#[test]
+fn set_interval_keeps_values_above_minimum() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = server(&Fake::default(), dir.path());
+    s.handle(AppMsg::SetInterval {
+        pane_poll_ms: 0,
+        scrape_ms: 5_000,
+        metrics_ms: 250,
+    });
+    assert_eq!(
+        s.intervals(),
+        Intervals {
+            pane_poll_ms: 250,
+            scrape_ms: 5_000,
+            metrics_ms: 250
         }
     );
 }

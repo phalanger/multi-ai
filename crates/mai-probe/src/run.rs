@@ -37,8 +37,18 @@ pub fn run<Z: Zellij>(
 ) -> io::Result<()> {
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
-        for line in input.lines() {
-            let Ok(line) = line else { break };
+        let mut input = input;
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            // Bytes, not `lines()`: a non-UTF-8 line must be reported as a
+            // bad message, not end the loop.
+            match input.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = String::from_utf8_lossy(&buf);
+            let line = line.trim_end_matches(['\r', '\n']).to_owned();
             if tx.send(line).is_err() {
                 break;
             }
