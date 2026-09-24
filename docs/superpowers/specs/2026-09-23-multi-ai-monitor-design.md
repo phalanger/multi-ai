@@ -109,8 +109,7 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 | 子命令 | 调用方 | 作用 |
 | --- | --- | --- |
 | `serve [--zellij <path>]` | 应用经 ProbeConn 启动 | 随 channel 存活，经 stdio 通信 |
-| `hook claude <event>` | Claude Code hooks | 读 stdin 与环境变量，写 spool 即返回 |
-| `hook codex <event>` | Codex hooks（`hooks.json`） | 同上；不用 `notify`（见 U4） |
+| `hook <agent>` | Claude Code / Codex hooks | 事件名取自载荷，写 spool 即返回 |
 | `emit --agent <name> --state <s> [--msg <m>]` | cmagent 及其他 agent | 通用上报接口 |
 | `install-hooks` / `uninstall-hooks` | 应用在部署后调用 | 合并式修改 agent 配置 |
 | `--version` | 应用部署时 | 输出版本与构建哈希 |
@@ -127,6 +126,8 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 ### 4.3 spool 目录
 
 - 位置：`<home>/.mai/spool/`，每个事件一个 JSON 行，按天分文件，追加写入。
+  文件名为自 epoch 起的 UTC 天数 `<day>.jsonl`；游标为 `(day << 40) | 行尾偏移`，
+  跨文件严格递增。数据目录可由 `MAI_HOME` 覆盖。
 - hook 子命令只追加写，不做网络与重计算，保证不拖慢 agent。
 - `serve` 启动时从上次确认的偏移量重放，运行中持续 tail。
 - 应用确认收到后，`serve` 更新偏移量文件；超过 7 天的 spool 文件自动清理。
@@ -214,7 +215,7 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 
 3. **agent pane 识别**（任一满足）：
    - 该 pane 曾产生 hook 事件；
-   - pane 标题或命令匹配规则；
+   - pane 标题或命令匹配规则；命令优先取 `list-panes -a` 的 `pane_command`（当前前台命令）；
    - 屏幕内容匹配 agent 特征规则。
 
    普通 shell pane 不在 UI 列表中显示。

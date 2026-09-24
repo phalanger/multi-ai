@@ -4,10 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 mai-protocol = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+sysinfo = "0.38"
 toml = { workspace = true }
 
 [dev-dependencies]
