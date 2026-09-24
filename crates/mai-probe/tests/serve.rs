@@ -273,6 +273,32 @@ fn vanished_pane_is_forgotten() {
 }
 
 #[test]
+fn last_session_gone_is_reported_and_agents_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::default();
+    {
+        let mut st = fake.0.borrow_mut();
+        st.sessions = vec![session("work")];
+        st.panes.insert("work".into(), vec![pane(4, "claude")]);
+    }
+    let mut s = server(&fake, dir.path());
+    assert_eq!(events(&s.tick(0)).len(), 1);
+    fake.0.borrow_mut().sessions = vec![];
+    let out = s.tick(2_000);
+    assert!(
+        out.iter()
+            .any(|m| matches!(m, ProbeMsg::Sessions { sessions } if sessions.is_empty())),
+        "{out:?}"
+    );
+    fake.0.borrow_mut().sessions = vec![session("work")];
+    let ev: Vec<(AgentState, EventSource)> = events(&s.tick(4_000))
+        .iter()
+        .map(|e| (e.state, e.source))
+        .collect();
+    assert_eq!(ev, vec![(AgentState::Unknown, EventSource::Scrape)]);
+}
+
+#[test]
 fn focus_and_paste_go_to_zellij() {
     let dir = tempfile::tempdir().unwrap();
     let fake = Fake::default();

@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 
-use mai_probe::zellij::{find_zellij, parse_panes, parse_sessions, parse_version};
+use mai_probe::zellij::{
+    find_zellij, parse_panes, parse_sessions, parse_version, sessions_from_output,
+};
 use mai_protocol::{PaneInfo, SessionInfo};
 
 #[test]
@@ -21,6 +23,36 @@ fn sessions_parse_names_and_exited_flag() {
             },
         ]
     );
+}
+
+#[test]
+fn no_sessions_message_means_empty_list() {
+    let msg = "No active zellij sessions found.\n";
+    assert_eq!(sessions_from_output(false, msg, ""), Ok(vec![]));
+    assert_eq!(sessions_from_output(true, msg, ""), Ok(vec![]));
+    assert_eq!(sessions_from_output(false, "", msg), Ok(vec![]));
+}
+
+#[test]
+fn sessions_output_success_parses_and_failure_is_error() {
+    assert_eq!(
+        sessions_from_output(true, "work [Created 1h ago] (current)\n", ""),
+        Ok(vec![SessionInfo {
+            name: "work".into(),
+            exited: false
+        }])
+    );
+    let err = sessions_from_output(false, "", "permission denied").unwrap_err();
+    assert!(err.0.contains("permission denied"), "{err}");
+}
+
+#[test]
+fn pane_with_only_required_fields_parses() {
+    let panes = parse_panes(r#"[{"id": 2, "is_plugin": false}]"#).unwrap();
+    assert_eq!(panes.len(), 1);
+    assert_eq!(panes[0].id, 2);
+    assert_eq!(panes[0].title, "");
+    assert!(!panes[0].exited);
 }
 
 /// Shape of `zellij action list-panes -a -j` (zellij 0.44.3), trimmed to

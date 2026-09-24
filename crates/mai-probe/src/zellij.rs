@@ -4,7 +4,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use mai_protocol::{PaneInfo, SessionInfo};
 use serde::Deserialize;
@@ -46,13 +46,40 @@ pub fn parse_sessions(text: &str) -> Vec<SessionInfo> {
         .collect()
 }
 
+/// What zellij prints (and possibly fails with) when no session exists.
+const NO_SESSIONS: &str = "No active zellij sessions";
+
+/// Interpret `zellij list-sessions -n` output. "No active sessions" is an
+/// empty list whatever the exit status, so the app learns that the last
+/// session is gone.
+pub fn sessions_from_output(
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Result<Vec<SessionInfo>, ZellijError> {
+    if stdout.contains(NO_SESSIONS) || stderr.contains(NO_SESSIONS) {
+        Ok(Vec::new())
+    } else if success {
+        Ok(parse_sessions(stdout))
+    } else {
+        Err(ZellijError(format!(
+            "zellij list-sessions failed: {}",
+            stderr.trim()
+        )))
+    }
+}
+
 #[derive(Deserialize)]
 struct RawPane {
     id: u32,
     is_plugin: bool,
+    #[serde(default)]
     title: String,
+    #[serde(default)]
     exited: bool,
+    #[serde(default)]
     tab_id: u32,
+    #[serde(default)]
     tab_name: String,
     terminal_command: Option<String>,
     /// Foreground command currently running in the pane (zellij >= 0.44
@@ -137,15 +164,24 @@ impl CliZellij {
         Self { exe }
     }
 
+    /// Run zellij; the output is returned whatever the exit status.
+    fn run_raw<I, S>(&self, args: I) -> Result<Output, ZellijError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new(&self.exe)
+            .args(args)
+            .output()
+            .map_err(|e| ZellijError(format!("spawn {}: {e}", self.exe.display())))
+    }
+
     fn run<I, S>(&self, args: I) -> Result<String, ZellijError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let out = Command::new(&self.exe)
-            .args(args)
-            .output()
-            .map_err(|e| ZellijError(format!("spawn {}: {e}", self.exe.display())))?;
+        let out = self.run_raw(args)?;
         if !out.status.success() {
             return Err(ZellijError(format!(
                 "zellij exited with {}: {}",
@@ -174,7 +210,12 @@ fn pane_arg(pane_id: u32) -> String {
 
 impl Zellij for CliZellij {
     fn sessions(&self) -> Result<Vec<SessionInfo>, ZellijError> {
-        Ok(parse_sessions(&self.run(["list-sessions", "-n"])?))
+        let out = self.run_raw(["list-sessions", "-n"])?;
+        sessions_from_output(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        )
     }
 
     fn panes(&self, session: &str) -> Result<Vec<PaneInfo>, ZellijError> {
