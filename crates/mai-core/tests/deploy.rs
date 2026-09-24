@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use mai_core::deploy::{
-    HookResult, Os, ProbeStore, Remote, Shell, normalize_arch, parse_hash, parse_hook_lines,
-    parse_uname, sha256_hex,
+    DeployError, HookResult, Os, ProbeStore, Remote, Shell, hooks_result, normalize_arch,
+    parse_hash, parse_hook_lines, parse_uname, sha256_hex,
 };
+use mai_core::ssh::client::ExecOutput;
 
 fn remote(os: Os, shell: Shell, home: &str) -> Remote {
     Remote {
@@ -156,4 +157,50 @@ not json
         }
     );
     assert_eq!(r[2].reason.as_deref(), Some("agent config dir not found"));
+}
+
+#[test]
+fn failing_install_hooks_is_reported_not_swallowed() {
+    let out = ExecOutput {
+        status: Some(1),
+        stdout: b"{\"agent\":\"claude\",\"outcome\":\"installed\"}\n".to_vec(),
+        stderr: b"permission denied".to_vec(),
+    };
+    let err = hooks_result(&out).unwrap_err();
+    assert_eq!(
+        err,
+        DeployError::Hooks {
+            status: Some(1),
+            stderr: "permission denied".into(),
+        }
+    );
+}
+
+#[test]
+fn missing_exit_status_is_also_reported() {
+    let out = ExecOutput {
+        status: None,
+        stdout: Vec::new(),
+        stderr: b"connection dropped".to_vec(),
+    };
+    let err = hooks_result(&out).unwrap_err();
+    assert_eq!(
+        err,
+        DeployError::Hooks {
+            status: None,
+            stderr: "connection dropped".into(),
+        }
+    );
+}
+
+#[test]
+fn successful_install_hooks_parses_output() {
+    let out = ExecOutput {
+        status: Some(0),
+        stdout: b"{\"agent\":\"claude\",\"outcome\":\"installed\"}\n".to_vec(),
+        stderr: Vec::new(),
+    };
+    let hooks = hooks_result(&out).unwrap();
+    assert_eq!(hooks.len(), 1);
+    assert_eq!(hooks[0].agent, "claude");
 }

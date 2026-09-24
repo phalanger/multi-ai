@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::ssh::auth::Prompter;
-use crate::ssh::client::{SshError, SshSession};
+use crate::ssh::client::{ExecOutput, SshError, SshSession};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -181,6 +181,19 @@ pub fn parse_hook_lines(out: &str) -> Vec<HookResult> {
         .collect()
 }
 
+/// Turn the finished `install-hooks` exec into its parsed results, or a
+/// `DeployError::Hooks` if the command itself failed (a non-zero or
+/// missing exit status is never silently treated as "no hooks installed").
+pub fn hooks_result(out: &ExecOutput) -> Result<Vec<HookResult>, DeployError> {
+    if !out.success() {
+        return Err(DeployError::Hooks {
+            status: out.status,
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(parse_hook_lines(&out.stdout_str()))
+}
+
 #[derive(Debug, Clone)]
 pub struct DeployOptions {
     /// Directory under the remote home; `.mai` in production (hooks are
@@ -210,8 +223,16 @@ pub struct DeployReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployError {
     Detect(String),
-    NoBinary { target: String, path: PathBuf },
+    NoBinary {
+        target: String,
+        path: PathBuf,
+    },
     Upload(String),
+    /// `install-hooks` exited with a non-zero (or missing) status.
+    Hooks {
+        status: Option<u32>,
+        stderr: String,
+    },
     Ssh(SshError),
 }
 
@@ -223,6 +244,9 @@ impl fmt::Display for DeployError {
                 write!(f, "no probe for {target} (expected {})", path.display())
             }
             Self::Upload(m) => write!(f, "upload probe: {m}"),
+            Self::Hooks { status, stderr } => {
+                write!(f, "install-hooks failed (status {status:?}): {stderr}")
+            }
             Self::Ssh(e) => write!(f, "{e}"),
         }
     }
@@ -365,7 +389,7 @@ pub async fn deploy<P: Prompter>(
     }
     let hooks = if opts.install_hooks {
         let out = s.exec(&remote.invoke(&probe_path, "install-hooks")).await?;
-        parse_hook_lines(&out.stdout_str())
+        hooks_result(&out)?
     } else {
         Vec::new()
     };
