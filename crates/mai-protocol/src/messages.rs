@@ -40,6 +40,9 @@ pub enum ProbeMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppMsg {
+    /// Acknowledges every event up to and including `spool_offset`, the
+    /// opaque, strictly increasing cursor the probe assigns per host
+    /// across all of its spool files.
     Ack {
         spool_offset: u64,
     },

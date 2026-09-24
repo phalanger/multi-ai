@@ -38,6 +38,9 @@ pub struct AgentEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub ts_ms: u64,
+    /// Opaque cursor assigned by the probe: strictly increasing per probe
+    /// host across all of its spool files. An `AppMsg::Ack` for this value
+    /// covers every event up to and including this cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spool_offset: Option<u64>,
 }
