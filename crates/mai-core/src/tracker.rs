@@ -58,6 +58,7 @@ pub struct AgentRecord {
     /// Timestamp at which `state` was entered.
     pub since_ms: u64,
     last_hook_ms: Option<u64>,
+    last_hook_offset: Option<u64>,
     last_alert: Option<(AgentState, u64)>,
 }
 
@@ -93,11 +94,24 @@ impl Tracker {
                 acknowledged: true,
                 since_ms: ev.ts_ms,
                 last_hook_ms: None,
+                last_hook_offset: None,
                 last_alert: None,
             }
         });
         match ev.source {
-            EventSource::Hook => rec.last_hook_ms = Some(ev.ts_ms),
+            EventSource::Hook => {
+                if let Some(o) = ev.spool_offset {
+                    if rec.last_hook_offset.is_some_and(|prev| o <= prev) {
+                        return None;
+                    }
+                } else if rec.last_hook_ms.is_some_and(|h| ev.ts_ms < h) {
+                    return None;
+                }
+                rec.last_hook_ms = Some(ev.ts_ms);
+                if let Some(o) = ev.spool_offset {
+                    rec.last_hook_offset = Some(o);
+                }
+            }
             EventSource::Scrape => {
                 let authoritative = rec.last_hook_ms.is_some_and(|h| {
                     ev.ts_ms.saturating_sub(h) < cfg.hook_authority_ms

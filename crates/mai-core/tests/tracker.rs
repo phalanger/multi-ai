@@ -27,6 +27,18 @@ fn key(pane: u32) -> AgentKey {
     AgentKey { host_id: HOST.into(), session: "work".into(), pane_id: pane }
 }
 
+fn ev_offset(
+    pane: u32,
+    source: EventSource,
+    state: AgentState,
+    ts: u64,
+    offset: u64,
+) -> AgentEvent {
+    let mut e = ev(pane, source, state, ts);
+    e.spool_offset = Some(offset);
+    e
+}
+
 struct Case {
     name: &'static str,
     steps: Vec<(EventSource, AgentState, u64, Option<AgentState>)>,
@@ -173,4 +185,51 @@ fn hosts_are_isolated() {
     t.apply("host-a", &ev(1, Hook, Done, 0));
     t.apply("host-b", &ev(1, Hook, Working, 0));
     assert_eq!(t.get(&key(1)).unwrap().state, Done);
+}
+
+#[test]
+fn replayed_hook_events_are_ignored() {
+    let mut t = Tracker::new(TrackerConfig::default());
+    assert!(t.apply(HOST, &ev_offset(1, Hook, Working, 1, 1)).is_none());
+    let alert = t.apply(HOST, &ev_offset(1, Hook, Done, 2, 2));
+    assert_eq!(alert.map(|a| a.state), Some(Done));
+    assert!(t.acknowledge(&key(1)));
+
+    assert!(t.apply(HOST, &ev_offset(1, Hook, Working, 1, 1)).is_none());
+    assert!(t.apply(HOST, &ev_offset(1, Hook, Done, 2, 2)).is_none());
+
+    let rec = t.get(&key(1)).expect("record");
+    assert_eq!(rec.state, Done);
+    assert!(rec.acknowledged);
+    assert_eq!(rec.since_ms, 2);
+    assert!(t.pending().is_empty());
+}
+
+#[test]
+fn older_hook_without_offset_is_ignored() {
+    let mut t = Tracker::new(TrackerConfig::default());
+    let alert = t.apply(HOST, &ev(1, Hook, Done, 5_000));
+    assert_eq!(alert.map(|a| a.state), Some(Done));
+
+    assert!(t.apply(HOST, &ev(1, Hook, Working, 1_000)).is_none());
+    assert_eq!(t.get(&key(1)).unwrap().state, Done);
+}
+
+#[test]
+fn dedupe_boundary_is_exclusive() {
+    let mut t = Tracker::new(TrackerConfig::default());
+    let a1 = t.apply(HOST, &ev(1, Hook, Done, 0));
+    assert_eq!(a1.map(|a| a.state), Some(Done));
+    assert!(t.apply(HOST, &ev(1, Hook, Working, 1_000)).is_none());
+    let a2 = t.apply(HOST, &ev(1, Hook, Done, 30_000));
+    assert_eq!(a2.map(|a| a.state), Some(Done));
+}
+
+#[test]
+fn hook_authority_boundary_is_exclusive() {
+    let mut t = Tracker::new(TrackerConfig::default());
+    assert!(t.apply(HOST, &ev(1, Hook, Working, 0)).is_none());
+    assert!(t.apply(HOST, &ev(1, Scrape, Done, 599_999)).is_none());
+    let a = t.apply(HOST, &ev(1, Scrape, Done, 600_000));
+    assert_eq!(a.map(|a| a.state), Some(Done));
 }
