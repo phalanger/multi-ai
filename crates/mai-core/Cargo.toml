@@ -1,0 +1,10 @@
+[package]
+name = "mai-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mai-protocol = { workspace = true }
+
+[lints]
+workspace = true

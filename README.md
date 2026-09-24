@@ -10,6 +10,7 @@ Design: `docs/superpowers/specs/2026-09-23-multi-ai-monitor-design.md`
 | crate | purpose |
 | --- | --- |
 | `mai-protocol` | probe/app wire messages (JSON Lines) |
+| `mai-core` | UI-independent core: agent state tracking and alerts |
 
 ## Development
 
