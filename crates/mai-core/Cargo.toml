@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 mai-protocol = { workspace = true }
+ssh2-config = "0.8"
 
 [lints]
 workspace = true
