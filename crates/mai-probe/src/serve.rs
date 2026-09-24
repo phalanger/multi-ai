@@ -46,6 +46,13 @@ pub(crate) fn due(last: Option<u64>, every_ms: u64, now_ms: u64) -> bool {
     last.is_none_or(|t| now_ms.saturating_sub(t) >= every_ms)
 }
 
+/// Agent bound to a pane, and whether a hook (rather than scraping)
+/// established the binding. Scrape bindings are re-checked every scrape.
+struct Binding {
+    agent: String,
+    from_hook: bool,
+}
+
 pub struct Server<Z> {
     zellij: Option<Z>,
     spool: Spool,
@@ -58,7 +65,7 @@ pub struct Server<Z> {
     sessions: Vec<SessionInfo>,
     panes: BTreeMap<String, Vec<PaneInfo>>,
     /// Panes known to run an agent (from hooks or identification).
-    agents: HashMap<PaneRef, String>,
+    agents: HashMap<PaneRef, Binding>,
     spool_failing: bool,
 }
 
@@ -128,10 +135,23 @@ impl<Z: Zellij> Server<Z> {
                 session: rec.session,
                 pane_id: rec.pane_id,
             };
+            let mapped = map_hook(&rec.agent, &rec.payload);
             if self.zellij.is_some() {
-                self.agents.insert(pane.clone(), rec.agent.clone());
+                if mapped
+                    .as_ref()
+                    .is_some_and(|m| m.state == AgentState::Exited)
+                {
+                    self.agents.remove(&pane);
+                    self.scrape.forget(&pane);
+                } else {
+                    let binding = Binding {
+                        agent: rec.agent.clone(),
+                        from_hook: true,
+                    };
+                    self.agents.insert(pane.clone(), binding);
+                }
             }
-            if let Some(m) = map_hook(&rec.agent, &rec.payload) {
+            if let Some(m) = mapped {
                 out.push(ProbeMsg::AgentEvent(AgentEvent {
                     pane,
                     agent: rec.agent,
@@ -222,14 +242,24 @@ impl<Z: Zellij> Server<Z> {
                         continue;
                     }
                 };
+                let found = rules.identify(&p.title, p.command.as_deref(), &screen);
                 let agent = match agents.get(&pane) {
-                    Some(a) => a.clone(),
+                    Some(b) if b.from_hook || found == Some(b.agent.as_str()) => b.agent.clone(),
+                    Some(b) => {
+                        // Agent is gone from a scrape-identified pane (e.g.
+                        // back at the shell): report it once and unbind.
+                        out.push(scrape_event(&pane, &b.agent, AgentState::Exited, now_ms));
+                        agents.remove(&pane);
+                        scrape.forget(&pane);
+                        continue;
+                    }
                     None => {
-                        let Some(a) = rules.identify(&p.title, p.command.as_deref(), &screen)
-                        else {
-                            continue;
+                        let Some(a) = found else { continue };
+                        let binding = Binding {
+                            agent: a.to_owned(),
+                            from_hook: false,
                         };
-                        agents.insert(pane.clone(), a.to_owned());
+                        agents.insert(pane.clone(), binding);
                         out.push(scrape_event(&pane, a, AgentState::Unknown, now_ms));
                         a.to_owned()
                     }

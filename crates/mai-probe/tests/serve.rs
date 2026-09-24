@@ -299,6 +299,68 @@ fn last_session_gone_is_reported_and_agents_pruned() {
 }
 
 #[test]
+fn scraped_agent_leaving_pane_is_reported_exited_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::default();
+    {
+        let mut st = fake.0.borrow_mut();
+        st.sessions = vec![session("work")];
+        st.panes.insert("work".into(), vec![pane(4, "claude")]);
+    }
+    let mut s = server(&fake, dir.path());
+    assert_eq!(events(&s.tick(0)).len(), 1);
+    {
+        let mut st = fake.0.borrow_mut();
+        st.panes.insert(
+            "work".into(),
+            vec![pane(4, "C:\\WINDOWS\\system32\\cmd.exe")],
+        );
+        st.screens.insert(4, "C:\\>".into());
+    }
+    let ev: Vec<(u32, AgentState, EventSource)> = events(&s.tick(3_000))
+        .iter()
+        .map(|e| (e.pane.pane_id, e.state, e.source))
+        .collect();
+    assert_eq!(ev, vec![(4, AgentState::Exited, EventSource::Scrape)]);
+    assert!(events(&s.tick(6_000)).is_empty());
+}
+
+#[test]
+fn session_end_hook_unbinds_pane() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::new(dir.path());
+    spool.append(&stop_record(1, 5)).unwrap();
+    let fake = Fake::default();
+    {
+        let mut st = fake.0.borrow_mut();
+        st.sessions = vec![session("work")];
+        st.panes.insert(
+            "work".into(),
+            vec![pane(5, "C:\\WINDOWS\\system32\\cmd.exe")],
+        );
+        st.screens.insert(5, fixture("claude-idle"));
+    }
+    let mut s = server(&fake, dir.path());
+    let ev: Vec<AgentState> = events(&s.tick(0)).iter().map(|e| e.state).collect();
+    assert_eq!(ev, vec![AgentState::Done]);
+
+    spool
+        .append(&SpoolRecord {
+            payload: json!({"hook_event_name": "SessionEnd"}),
+            ..stop_record(2, 5)
+        })
+        .unwrap();
+    fake.0.borrow_mut().screens.insert(5, "C:\\>".into());
+    let ev: Vec<(AgentState, EventSource)> = events(&s.tick(3_000))
+        .iter()
+        .map(|e| (e.state, e.source))
+        .collect();
+    assert_eq!(ev, vec![(AgentState::Exited, EventSource::Hook)]);
+    assert!(events(&s.tick(6_000)).is_empty());
+    assert!(events(&s.tick(12_000)).is_empty());
+}
+
+#[test]
 fn focus_and_paste_go_to_zellij() {
     let dir = tempfile::tempdir().unwrap();
     let fake = Fake::default();
