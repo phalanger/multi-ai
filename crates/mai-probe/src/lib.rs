@@ -4,3 +4,4 @@ pub mod hookmap;
 pub mod rules;
 pub mod scrape;
 pub mod spool;
+pub mod zellij;
