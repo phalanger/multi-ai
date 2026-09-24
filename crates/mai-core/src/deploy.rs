@@ -268,10 +268,20 @@ pub async fn detect<P: Prompter>(s: &SshSession<P>) -> Result<Remote, DeployErro
         Shell::Cmd => ("echo %PROCESSOR_ARCHITECTURE%", "echo %USERPROFILE%"),
         _ => ("$env:PROCESSOR_ARCHITECTURE", "$env:USERPROFILE"),
     };
+    // A Unix other than Linux/macOS also lands here (its sh echoes %OS%
+    // verbatim); report uname's output so that case is recognisable.
     let raw_arch = s.exec(arch_cmd).await?.stdout_str();
-    let arch = normalize_arch(&raw_arch)
-        .ok_or_else(|| DeployError::Detect(format!("unknown CPU {:?}", raw_arch.trim())))?;
+    let arch = normalize_arch(&raw_arch).ok_or_else(|| {
+        DeployError::Detect(format!(
+            "unknown CPU {:?} (uname: {:?})",
+            raw_arch.trim(),
+            uname.stdout_str().trim()
+        ))
+    })?;
     let home = s.exec(home_cmd).await?.stdout_str().trim().to_owned();
+    if home.is_empty() {
+        return Err(DeployError::Detect("empty %USERPROFILE%".into()));
+    }
     Ok(Remote {
         os: Os::Windows,
         arch,
