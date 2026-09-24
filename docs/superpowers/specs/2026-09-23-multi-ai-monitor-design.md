@@ -110,7 +110,7 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 | --- | --- | --- |
 | `serve [--zellij <path>]` | 应用经 ProbeConn 启动 | 随 channel 存活，经 stdio 通信 |
 | `hook claude <event>` | Claude Code hooks | 读 stdin 与环境变量，写 spool 即返回 |
-| `hook codex` | Codex `notify` | 同上；若存在原 notify 程序则继续调用 |
+| `hook codex <event>` | Codex hooks（`hooks.json`） | 同上；不用 `notify`（见 U4） |
 | `emit --agent <name> --state <s> [--msg <m>]` | cmagent 及其他 agent | 通用上报接口 |
 | `install-hooks` / `uninstall-hooks` | 应用在部署后调用 | 合并式修改 agent 配置 |
 | `--version` | 应用部署时 | 输出版本与构建哈希 |
@@ -135,14 +135,19 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 
 - `~/.claude/settings.json`：在对应事件下追加带 `mai` 标识的 hook 条目；保留用户已有条目；
   修改前备份为 `settings.json.mai-bak-<时间戳>`。
-- `~/.codex/config.toml`：若 `notify` 未设置，设为 `mai-probe hook codex`；
-  若已设置为其他程序，把原值记入 `<home>/.mai/codex-notify-chain.json`，`hook codex` 处理后继续调用原程序。
-- `uninstall-hooks` 仅移除带 `mai` 标识的条目，并恢复 Codex 原 notify。
+- `~/.codex/hooks.json`：与 Claude 相同的合并方式追加带 `mai` 标识的条目。
+  不使用 `notify`：它会被 Codex 内部轮次（如生成标题）触发，产生误报。
+  Codex 的非托管 hooks 需用户信任后才运行（在 Codex 中执行 `/hooks`）；
+  安装后应用提示用户完成信任，具体检测方式在 02-probe 中确定。
+- `uninstall-hooks` 仅移除带 `mai` 标识的条目。
 - 解析失败（配置文件格式异常）时不写入，返回错误，由应用提示用户。
 
 ### 4.5 zellij 环境检查
 
-- `serve` 启动后按顺序查找 zellij：`--zellij` 参数、PATH。
+- `serve` 启动后按顺序查找 zellij：`--zellij` 参数、PATH、常见安装位置
+  （`/opt/homebrew/bin`、`/usr/local/bin`、`~/.cargo/bin`、`~/.local/bin`）、
+  登录 shell（`$SHELL -lc 'command -v zellij'`）。
+  非交互 SSH exec 的 PATH 常不含这些位置（spike 在 macOS 上证实）。
 - 找不到：`Hello` 中报告 `zellij: null`，应用提示用户“将 zellij 加入 PATH 或在主机设置中填写路径”，
   该主机的监控停在此步，不做猜测。
 
@@ -187,16 +192,22 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 
    | agent | 事件 | 映射状态 |
    | --- | --- | --- |
-   | Claude Code | UserPromptSubmit、PreToolUse | Working |
-   | Claude Code | Notification（授权请求、空闲等待输入） | NeedsInput |
-   | Claude Code | Stop | Done |
+   | Claude Code | UserPromptSubmit、PreToolUse、PostToolUse | Working |
+   | Claude Code | Notification（`permission_prompt`） | NeedsInput |
+   | Claude Code | Stop；Notification（`idle_prompt`） | Done |
    | Claude Code | SessionEnd | Exited |
-   | Codex | notify: agent-turn-complete | Done |
+   | Codex | UserPromptSubmit、PreToolUse、PostToolUse | Working |
+   | Codex | PermissionRequest | NeedsInput |
+   | Codex | Stop、Interrupt | Done |
+   | Codex | SessionEnd | Exited |
    | 其他 | `mai-probe emit --state <s>` | 按参数 |
 
-   Claude Code 与 Codex 的事件名和载荷以实现时的当前版本为准（待验证项 U3、U4）。
+   事件与载荷样本见 `docs/superpowers/spike-data/`，
+   详见 `2026-09-23-spike-findings.md`（U3、U4）。
 
 2. **抓屏兜底**：对无 hook 覆盖的 agent pane，按间隔执行 `zellij action dump-screen -p <pane>`：
+   - 先删除匹配忽略规则的行（状态栏倒计时、空闲动画等），再计算哈希；
+     spike 证实 Claude 与 Codex 空闲时屏幕仍会变化。
    - 屏幕内容哈希持续变化，判为 Working。
    - 稳定超过 N 秒（默认 5）且匹配 NeedsInput 规则，判为 NeedsInput；匹配 Done 规则，判为 Done。
    - 规则按 agent 写在规则文件（TOML，正则），应用下发给探针，可热更新。
@@ -227,6 +238,10 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 
 - 每个已打开的 `(host, session)` 对应 UI 中一个终端标签，内容为 xterm.js。
 - 远程：TermConn 上开 PTY channel，`TERM=xterm-256color`，执行 `<zellij> attach <session>`。
+- 远程命令必须使用 UTF-8 locale：优先经 SSH env 请求发送 `LANG`/`LC_CTYPE`，
+  服务器拒绝时在命令前加 `LANG=... LC_CTYPE=...`。否则 macOS 上中文输入异常。
+- xterm.js 必须加载 `@xterm/addon-clipboard`（zellij 复制走 OSC 52）与
+  `@xterm/addon-unicode11`（宽字符宽度与 zellij 一致）。
 - 本机：portable-pty 执行同样命令。
 - 窗口尺寸变化同步到 PTY（window-change）。
 - 字节流：PTY 输出经 Tauri event 推给前端，前端键盘输入经 Tauri command 写回 PTY。
@@ -242,9 +257,11 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 
 ### 8.2 风险
 
-zellij 支持多客户端 attach，焦点可能按客户端独立。`zellij action focus-pane-id` 作用于哪个客户端
-需要 spike 验证（待验证项 U1）。若无法作用于应用自己的客户端，备选方案为在应用的 PTY 中
-发送 zellij 按键序列完成跳转。
+spike（U1）证实：外部 `zellij action focus-pane-id`、`go-to-tab-*` 只作用于
+最近有输入的客户端。用户只在应用内操作时，跳转正确；若用户同时在其他终端
+attach 同一 session 并有输入，跳转会作用到那个终端。
+04-app 需先实验能否让应用的客户端成为最近活跃客户端（如焦点事件、尺寸变化）；
+不可靠时改为在应用的 PTY 中发送 zellij 按键序列完成跳转。
 
 ## 9. UI
 
@@ -296,7 +313,7 @@ zellij 支持多客户端 attach，焦点可能按客户端独立。`zellij acti
 | `mai-protocol` | 序列化/反序列化往返单元测试 |
 | 状态机 | 表驱动测试：输入事件序列，断言状态与提醒输出 |
 | 抓屏规则 | 以真实屏幕快照为用例的规则测试 |
-| hook 安装 | 对各类已有配置文件（空、已有 hooks、已有 notify、格式错误）的合并测试 |
+| hook 安装 | 对各类已有配置文件（空、已有 hooks、格式错误）的合并测试 |
 | `mai-probe serve` | 本机端到端测试（本机有 zellij） |
 | SSH | 用本机/CI 的 OpenSSH 服务做集成测试 |
 
