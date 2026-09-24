@@ -230,7 +230,16 @@ fn cmd_serve(home: &Path, zellij: Option<PathBuf>, rules: Option<PathBuf>) -> io
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // Claude Code treats hook exit code 2 as "block the action": a
+        // usage error in a hook command must never do that.
+        Err(e) if env::args_os().nth(1).is_some_and(|a| a == "hook") => {
+            eprintln!("mai-probe hook: {e}");
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => e.exit(),
+    };
     let home = home_dir();
     match cli.cmd {
         Cmd::Serve { zellij, rules } => match cmd_serve(&home, zellij, rules) {
