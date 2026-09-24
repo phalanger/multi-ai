@@ -182,7 +182,7 @@ impl Tracker {
             .collect();
         v.sort_by_key(|r| {
             let rank = u8::from(r.state != AgentState::NeedsInput);
-            (rank, r.since_ms, r.key.pane_id)
+            (rank, r.since_ms, &r.key.host_id, &r.key.session, r.key.pane_id)
         });
         v
     }

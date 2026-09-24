@@ -233,3 +233,13 @@ fn hook_authority_boundary_is_exclusive() {
     let a = t.apply(HOST, &ev(1, Scrape, Done, 600_000));
     assert_eq!(a.map(|a| a.state), Some(Done));
 }
+
+#[test]
+fn pending_tie_break_is_deterministic() {
+    let mut t = Tracker::new(TrackerConfig::default());
+    t.apply("host-b", &ev(1, Hook, Done, 100));
+    t.apply("host-a", &ev(1, Hook, Done, 100));
+    let order: Vec<&str> =
+        t.pending().iter().map(|r| r.key.host_id.as_str()).collect();
+    assert_eq!(order, vec!["host-a", "host-b"]);
+}
