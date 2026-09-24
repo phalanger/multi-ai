@@ -2,7 +2,6 @@
 //! external sshd). Keys are generated per test run.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -139,6 +138,8 @@ async fn start(cfg: ServerCfg) -> (u16, PublicKey) {
 #[derive(Default)]
 struct Scripted {
     trust: bool,
+    /// How long the user "thinks" before answering the host-key prompt.
+    confirm_delay: Duration,
     password: Option<Secret>,
     passphrase: Option<Secret>,
     kbd: Option<Vec<String>>,
@@ -157,8 +158,11 @@ impl Scripted {
 impl Prompter for Scripted {
     fn confirm_host_key(&self, _h: &str, _p: u16, _fp: &str) -> impl Future<Output = bool> + Send {
         self.log("host_key");
-        let t = self.trust;
-        async move { t }
+        let (t, delay) = (self.trust, self.confirm_delay);
+        async move {
+            tokio::time::sleep(delay).await;
+            t
+        }
     }
     fn password(&self, _u: &str, _h: &str) -> impl Future<Output = Option<Secret>> + Send {
         self.log("password");
@@ -501,4 +505,28 @@ async fn unreachable_host_is_a_connect_error() {
     .err()
     .unwrap();
     assert!(matches!(err, SshError::Connect(_)), "{err:?}");
+}
+
+/// The connect timeout must not count the time the user spends on the
+/// host-key prompt.
+#[tokio::test]
+async fn slow_host_key_answer_does_not_time_out() {
+    let (port, _) = start(ServerCfg {
+        methods: vec![MethodKind::Password],
+        client_key: None,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.timeout = Duration::from_millis(300);
+    let p = Arc::new(Scripted {
+        trust: true,
+        confirm_delay: Duration::from_millis(900),
+        password: secret(PASSWORD, false),
+        ..Default::default()
+    });
+    connect(&spec(port, vec![]), &o, p.clone(), &MemStore::default())
+        .await
+        .unwrap();
+    assert_eq!(p.calls(), vec!["host_key", "password"]);
 }

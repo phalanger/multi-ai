@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -98,6 +99,9 @@ pub struct Checker<P> {
     opts: ConnectOptions,
     prompter: Arc<P>,
     verdict: Verdict,
+    /// True while the user is answering the host-key prompt; the connect
+    /// timeout does not count that time.
+    prompting: Arc<AtomicBool>,
 }
 
 impl<P: Prompter> client::Handler for Checker<P> {
@@ -126,11 +130,13 @@ impl<P: Prompter> client::Handler for Checker<P> {
             }
             HostKeyStatus::Unknown => {
                 let fp = hostkey::fingerprint(key);
-                if !self
+                self.prompting.store(true, Ordering::SeqCst);
+                let trusted = self
                     .prompter
                     .confirm_host_key(&self.host, self.port, &fp)
-                    .await
-                {
+                    .await;
+                self.prompting.store(false, Ordering::SeqCst);
+                if !trusted {
                     self.refuse(SshError::HostKeyRejected {
                         host: self.host.clone(),
                         port: self.port,
@@ -212,43 +218,59 @@ async fn connect_hop<P: Prompter, S: SecretStore>(
     via: Option<SshSession<P>>,
 ) -> Result<SshSession<P>, SshError> {
     let verdict: Verdict = Arc::default();
+    let prompting = Arc::new(AtomicBool::new(false));
     let checker = Checker {
         host: hop.host.clone(),
         port: hop.port,
         opts: opts.clone(),
         prompter: prompter.clone(),
         verdict: verdict.clone(),
+        prompting: prompting.clone(),
     };
-    let connecting = async {
-        match &via {
-            None => client::connect(client_config(), (hop.host.as_str(), hop.port), checker).await,
-            Some(outer) => {
-                let ch = outer
-                    .handle
-                    .channel_open_direct_tcpip(
-                        hop.host.clone(),
-                        u32::from(hop.port),
-                        "127.0.0.1",
-                        0,
-                    )
-                    .await?;
-                client::connect_stream(client_config(), ch.into_stream(), checker).await
+    let result = {
+        let connecting = async {
+            match &via {
+                None => {
+                    client::connect(client_config(), (hop.host.as_str(), hop.port), checker).await
+                }
+                Some(outer) => {
+                    let ch = outer
+                        .handle
+                        .channel_open_direct_tcpip(
+                            hop.host.clone(),
+                            u32::from(hop.port),
+                            "127.0.0.1",
+                            0,
+                        )
+                        .await?;
+                    client::connect_stream(client_config(), ch.into_stream(), checker).await
+                }
+            }
+        };
+        // The timeout covers TCP connect and key exchange; while the user
+        // is answering the host-key prompt the timer is re-armed instead.
+        tokio::pin!(connecting);
+        loop {
+            tokio::select! {
+                r = &mut connecting => break r,
+                _ = tokio::time::sleep(opts.timeout) => {
+                    if !prompting.load(Ordering::SeqCst) {
+                        return Err(SshError::Connect(format!(
+                            "{}:{} timed out",
+                            hop.host, hop.port
+                        )));
+                    }
+                }
             }
         }
     };
-    let mut handle = match tokio::time::timeout(opts.timeout, connecting).await {
-        Err(_) => {
-            return Err(SshError::Connect(format!(
-                "{}:{} timed out",
-                hop.host, hop.port
-            )));
-        }
-        Ok(Err(e)) => {
+    let mut handle = match result {
+        Err(e) => {
             let refused = verdict.lock().ok().and_then(|mut v| v.take());
             return Err(refused
                 .unwrap_or_else(|| SshError::Connect(format!("{}:{}: {e}", hop.host, hop.port))));
         }
-        Ok(Ok(h)) => h,
+        Ok(h) => h,
     };
     authenticate(&mut handle, hop, prompter.as_ref(), secrets).await?;
     Ok(SshSession {
@@ -261,15 +283,32 @@ fn offers(methods: &Option<MethodSet>, kind: MethodKind) -> bool {
     methods.as_ref().is_none_or(|m| m.contains(&kind))
 }
 
-/// Record the server's remaining methods after a failure; true on success.
-fn note(methods: &mut Option<MethodSet>, r: &client::AuthResult) -> bool {
-    if let client::AuthResult::Failure {
-        remaining_methods, ..
-    } = r
-    {
-        *methods = Some(remaining_methods.clone());
+/// Result of one authentication attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Fully authenticated.
+    Done,
+    /// This factor was accepted but the server wants more (e.g. 2FA).
+    Partial,
+    Failed,
+}
+
+/// Record the server's remaining methods and classify the result.
+fn step(methods: &mut Option<MethodSet>, r: &client::AuthResult) -> Step {
+    match r {
+        client::AuthResult::Success => Step::Done,
+        client::AuthResult::Failure {
+            remaining_methods,
+            partial_success,
+        } => {
+            *methods = Some(remaining_methods.clone());
+            if *partial_success {
+                Step::Partial
+            } else {
+                Step::Failed
+            }
+        }
     }
-    r.success()
 }
 
 async fn authenticate<P: Prompter, S: SecretStore>(
@@ -285,7 +324,10 @@ async fn authenticate<P: Prompter, S: SecretStore>(
             remaining_methods, ..
         } => Some(remaining_methods),
     };
-    if offers(&methods, MethodKind::PublicKey) {
+    'keys: {
+        if !offers(&methods, MethodKind::PublicKey) {
+            break 'keys;
+        }
         for path in spec.identity_files.iter().filter(|p| p.is_file()) {
             let Some(key) = load_key(path, prompter, secrets).await else {
                 continue;
@@ -299,8 +341,10 @@ async fn authenticate<P: Prompter, S: SecretStore>(
                 .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
                 .await
                 .map_err(auth_err)?;
-            if note(&mut methods, &r) {
-                return Ok(());
+            match step(&mut methods, &r) {
+                Step::Done => return Ok(()),
+                Step::Partial => break 'keys,
+                Step::Failed => {}
             }
         }
         if try_agent(h, user).await? {
@@ -310,22 +354,30 @@ async fn authenticate<P: Prompter, S: SecretStore>(
 
     if offers(&methods, MethodKind::Password) {
         let key = password_key(&spec.alias);
+        let mut accepted = false;
         if let Some(pw) = secrets.get(&key) {
             let r = h.authenticate_password(user, pw).await.map_err(auth_err)?;
-            if note(&mut methods, &r) {
-                return Ok(());
+            match step(&mut methods, &r) {
+                Step::Done => return Ok(()),
+                Step::Partial => accepted = true,
+                Step::Failed => {
+                    let _ = secrets.delete(&key);
+                }
             }
-            let _ = secrets.delete(&key);
         }
-        if let Some(s) = prompter.password(user, &spec.host).await {
+        if !accepted
+            && offers(&methods, MethodKind::Password)
+            && let Some(s) = prompter.password(user, &spec.host).await
+        {
             let r = h
                 .authenticate_password(user, s.value.clone())
                 .await
                 .map_err(auth_err)?;
-            if note(&mut methods, &r) {
-                if s.remember {
-                    let _ = secrets.set(&key, &s.value);
-                }
+            let result = step(&mut methods, &r);
+            if result != Step::Failed && s.remember {
+                let _ = secrets.set(&key, &s.value);
+            }
+            if result == Step::Done {
                 return Ok(());
             }
         }
@@ -513,5 +565,42 @@ impl<P: Prompter> SshSession<P> {
             .handle
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await;
+    }
+}
+
+// `step` is tested here because the in-process russh test server never
+// sends `partial_success = true` (russh 0.63 resets it), so the 2FA path
+// cannot be driven end-to-end in tests/ssh_session.rs.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(methods: &[MethodKind], partial: bool) -> client::AuthResult {
+        client::AuthResult::Failure {
+            remaining_methods: MethodSet::from(methods),
+            partial_success: partial,
+        }
+    }
+
+    #[test]
+    fn step_classifies_success_partial_and_failure() {
+        let mut methods = None;
+        assert_eq!(step(&mut methods, &client::AuthResult::Success), Step::Done);
+        assert_eq!(methods, None);
+
+        let r = failure(&[MethodKind::KeyboardInteractive], true);
+        assert_eq!(step(&mut methods, &r), Step::Partial);
+        assert!(!offers(&methods, MethodKind::Password));
+        assert!(offers(&methods, MethodKind::KeyboardInteractive));
+
+        let r = failure(&[MethodKind::Password], false);
+        assert_eq!(step(&mut methods, &r), Step::Failed);
+        assert!(offers(&methods, MethodKind::Password));
+    }
+
+    #[test]
+    fn unknown_method_set_offers_everything() {
+        assert!(offers(&None, MethodKind::PublicKey));
+        assert!(offers(&None, MethodKind::Password));
     }
 }
