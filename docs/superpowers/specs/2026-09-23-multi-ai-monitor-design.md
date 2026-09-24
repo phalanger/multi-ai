@@ -41,7 +41,7 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 | --- | --- | --- | --- |
 | `mai-protocol` | lib | 探针与应用之间的消息类型（serde），协议版本常量 | serde |
 | `mai-probe` | bin | 远程探针：serve、hook、emit 等子命令 | mai-protocol, sysinfo |
-| `mai-core` | lib | 连接、部署、状态机、通知抽象、钥匙串、配置 | mai-protocol, russh, keyring |
+| `mai-core` | lib | 连接、部署、状态机、配置 | russh（ring）,russh-sftp,ssh2-config,keyring |
 | `mai-app` | bin | Tauri 外壳：暴露 mai-core，承载前端 | mai-core, tauri |
 
 前端代码位于 `mai-app/ui/`（TypeScript + xterm.js）。
@@ -78,18 +78,21 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 ### 3.1 主机配置
 
 - 在 UI 中手动添加，或从 `~/.ssh/config` 导入 Host 别名。
-- 自行解析 `~/.ssh/config`，支持：HostName、User、Port、IdentityFile、ProxyJump。
+- 自行解析 `~/.ssh/config`（ssh2-config；跳板主机自身的 `ProxyJump` 不再展开），
+  支持：HostName、User、Port、IdentityFile、ProxyJump。
 - 每台主机可选配置：zellij 可执行文件路径、默认 session、探针轮询间隔。
 
 ### 3.2 认证顺序
+
+先以 `none` 查询服务器允许的方法，未提供的方法跳过。
 
 1. 配置或 ssh config 中指定的私钥（口令从钥匙串读取，缺失则弹窗输入并询问是否保存）。
 2. ssh-agent（macOS：`SSH_AUTH_SOCK`；Windows：OpenSSH Agent 命名管道，Pageant 可选）。
 3. 钥匙串中保存的密码。
 4. 弹窗输入密码；keyboard-interactive / 2FA 弹窗逐项交互。
 
-密码与口令只存系统钥匙串（`keyring` crate），配置文件只保存引用键
-`multi-ai/<host-id>/<kind>`。
+密码与口令失效时从钥匙串删除。密码与口令只存系统钥匙串（`keyring` crate），
+服务名 `multi-ai`，键为 `<host>/password` 与 `passphrase:<私钥路径>`。
 
 ### 3.3 主机密钥校验
 
@@ -120,10 +123,13 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 
 ### 4.2 部署流程
 
-1. 探测系统与架构：执行 `uname -sm`；失败则按 Windows 处理，用 PowerShell 查询
-   `$env:PROCESSOR_ARCHITECTURE`。需兼容 Windows OpenSSH 默认 shell 为 cmd 或 PowerShell。
-2. 执行 `<home>/.mai/bin/mai-probe --version`，与内置版本（含构建哈希）比对。
+1. 探测：`uname -sm` 成功为 Linux/macOS；否则以 `echo %OS%` 区分 Windows 的
+   cmd（输出 `Windows_NT`）与 PowerShell（原样输出），再取 CPU 与 home。
+2. 以远程命令计算 `<home>/.mai/bin/mai-probe` 的 SHA-256
+   （`sha256sum`、`shasum -a 256`、`certutil`、`Get-FileHash`），
+   与应用内置二进制比较；一致则跳过上传。
 3. 不一致或不存在：SFTP 上传到临时名，校验后原子重命名；SFTP 不可用则回退 exec 写入。
+   SFTP 路径相对登录目录（`.mai/bin/...`）；内置二进制来自 CI 产物 `probes/<target>/`。
 4. 执行 `mai-probe install-hooks`（幂等）。
 5. 执行 `mai-probe serve`。
 
