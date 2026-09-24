@@ -274,6 +274,43 @@ async fn prompted_password_is_remembered_and_host_key_learned() {
     assert!(p2.calls().is_empty(), "{:?}", p2.calls());
 }
 
+/// `learn_to` need not be listed in `known_hosts` for a key already
+/// learned there to be found again: the checker always consults it too.
+#[tokio::test]
+async fn learn_to_is_checked_even_if_absent_from_known_hosts() {
+    let (port, _) = start(ServerCfg {
+        methods: vec![MethodKind::Password],
+        client_key: None,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let o = ConnectOptions {
+        known_hosts: vec![dir.path().join("does_not_exist")],
+        learn_to: dir.path().join("app_known_hosts"),
+        timeout: Duration::from_secs(10),
+    };
+    let p = Arc::new(Scripted {
+        trust: true,
+        password: secret(PASSWORD, false),
+        ..Default::default()
+    });
+    connect(&spec(port, vec![]), &o, p.clone(), &MemStore::default())
+        .await
+        .unwrap();
+    assert_eq!(p.calls(), vec!["host_key", "password"]);
+
+    // Second connection: `known_hosts` still does not list `learn_to`, but
+    // the key was written there, so it must be found without a prompt.
+    let p2 = Arc::new(Scripted {
+        password: secret(PASSWORD, false),
+        ..Default::default()
+    });
+    connect(&spec(port, vec![]), &o, p2.clone(), &MemStore::default())
+        .await
+        .unwrap();
+    assert_eq!(p2.calls(), vec!["password"]);
+}
+
 #[tokio::test]
 async fn wrong_stored_password_is_dropped_then_prompted() {
     let (port, _) = start(ServerCfg {

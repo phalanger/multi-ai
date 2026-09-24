@@ -4,14 +4,26 @@
 //! Secrets (passwords, key passphrases) live only in a `SecretStore`,
 //! by default the OS keychain.
 
+use std::fmt;
 use std::future::Future;
 use std::path::Path;
 
 /// A secret typed by the user, and whether to remember it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Secret {
     pub value: String,
     pub remember: bool,
+}
+
+impl fmt::Debug for Secret {
+    /// Redacts `value`: secrets must never end up in logs or panic
+    /// messages via a derived `Debug`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Secret")
+            .field("value", &"<redacted>")
+            .field("remember", &self.remember)
+            .finish()
+    }
 }
 
 /// One keyboard-interactive prompt: text and whether input is echoed.
@@ -86,5 +98,22 @@ impl SecretStore for KeyringStore {
         keyring::Entry::new(KEYRING_SERVICE, key)
             .and_then(|e| e.delete_credential())
             .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_debug_redacts_value() {
+        let s = Secret {
+            value: "hunter2".into(),
+            remember: true,
+        };
+        let debug = format!("{s:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("redacted"), "{debug}");
+        assert!(debug.contains("true"), "{debug}");
     }
 }

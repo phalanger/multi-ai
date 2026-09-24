@@ -71,3 +71,28 @@ fn fingerprint_is_openssh_sha256_form() {
     assert!(fp.starts_with("SHA256:"), "{fp}");
     assert_eq!(fp.len(), "SHA256:".len() + 43, "{fp}");
 }
+
+#[test]
+fn invalid_utf8_line_is_unreadable() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("known_hosts");
+    std::fs::write(&file, [b'h', 0xff, 0xfe, b'\n']).unwrap();
+    let status = check(std::slice::from_ref(&file), "h", 22, key().public_key());
+    assert!(
+        matches!(&status, HostKeyStatus::Unreadable { file: f, .. } if *f == file),
+        "{status:?}"
+    );
+}
+
+#[test]
+fn mixed_case_host_matches_lowercase_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("known_hosts");
+    let k = key();
+    learn(&file, "Example.ORG", 22, k.public_key()).unwrap();
+    let files = vec![file];
+    assert_eq!(
+        check(&files, "eXaMpLe.org", 22, k.public_key()),
+        HostKeyStatus::Known
+    );
+}

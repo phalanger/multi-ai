@@ -35,6 +35,10 @@ pub struct ConnectOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshError {
+    /// TCP, key exchange, or transport failure, including a transport
+    /// error raised while an authentication call was in flight (the server
+    /// or network dropped the connection, not a rejected credential).
+    /// Retryable: the 03b host manager reconnects on this.
     Connect(String),
     /// The user declined an unknown host key.
     HostKeyRejected {
@@ -49,6 +53,10 @@ pub enum SshError {
         file: PathBuf,
         line: usize,
     },
+    /// No authentication method succeeded: the server ran out of methods
+    /// to offer. Not retryable by reconnecting; needs the user to supply
+    /// different credentials. The 03b host manager treats this as
+    /// `AuthRequired` and does not auto-retry.
     Auth(String),
     Channel(String),
 }
@@ -86,8 +94,12 @@ fn chan_err(e: impl fmt::Display) -> SshError {
     SshError::Channel(e.to_string())
 }
 
-fn auth_err(e: impl fmt::Display) -> SshError {
-    SshError::Auth(e.to_string())
+/// A `russh::Error` raised by an authentication call is a transport
+/// failure, not a rejected credential: russh only reports rejection
+/// through `AuthResult::Failure`. `SshError::Auth` is reserved for
+/// "no method succeeded" once every offered method has been tried.
+fn connect_err(e: impl fmt::Display) -> SshError {
+    SshError::Connect(e.to_string())
 }
 
 /// Why a host key was refused, filled in by the handler.
@@ -106,6 +118,18 @@ struct HopState {
     phase: AtomicU8,
     /// Incremented when a prompt finishes; the timer then starts afresh.
     prompts_done: AtomicU64,
+}
+
+/// Files to check a host key against: `known_hosts`, plus `learn_to` if it
+/// isn't already one of them. This way a caller whose `learn_to` is not
+/// listed in `known_hosts` is not re-prompted on every connect for a key
+/// it already learned and wrote there itself.
+fn check_files(opts: &ConnectOptions) -> Vec<PathBuf> {
+    let mut files = opts.known_hosts.clone();
+    if !files.contains(&opts.learn_to) {
+        files.push(opts.learn_to.clone());
+    }
+    files
 }
 
 pub struct Checker<P> {
@@ -130,7 +154,7 @@ impl<P: Prompter> client::Handler for Checker<P> {
             ));
             return Ok(false);
         };
-        match hostkey::check(&self.opts.known_hosts, &self.host, self.port, key) {
+        match hostkey::check(&check_files(&self.opts), &self.host, self.port, key) {
             HostKeyStatus::Known => Ok(true),
             HostKeyStatus::Changed { file, line } => {
                 self.refuse(SshError::HostKeyChanged {
@@ -139,6 +163,15 @@ impl<P: Prompter> client::Handler for Checker<P> {
                     file,
                     line,
                 });
+                Ok(false)
+            }
+            HostKeyStatus::Unreadable { file, error } => {
+                // Fail closed: never let an unparsable file fall through
+                // to an Unknown-host prompt. No prompt is shown.
+                self.refuse(SshError::Connect(format!(
+                    "cannot read known_hosts file {}: {error}",
+                    file.display()
+                )));
                 Ok(false)
             }
             HostKeyStatus::Unknown => {
@@ -360,7 +393,7 @@ async fn authenticate<P: Prompter, S: SecretStore>(
     secrets: &S,
 ) -> Result<(), SshError> {
     let user = spec.user.as_str();
-    let mut methods = match h.authenticate_none(user).await.map_err(auth_err)? {
+    let mut methods = match h.authenticate_none(user).await.map_err(connect_err)? {
         client::AuthResult::Success => return Ok(()),
         client::AuthResult::Failure {
             remaining_methods, ..
@@ -377,12 +410,12 @@ async fn authenticate<P: Prompter, S: SecretStore>(
             let hash = h
                 .best_supported_rsa_hash()
                 .await
-                .map_err(auth_err)?
+                .map_err(connect_err)?
                 .flatten();
             let r = h
                 .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
                 .await
-                .map_err(auth_err)?;
+                .map_err(connect_err)?;
             match step(&mut methods, &r) {
                 Step::Done => return Ok(()),
                 Step::Partial => break 'keys,
@@ -398,7 +431,10 @@ async fn authenticate<P: Prompter, S: SecretStore>(
         let key = password_key(&spec.alias);
         let mut accepted = false;
         if let Some(pw) = secrets.get(&key) {
-            let r = h.authenticate_password(user, pw).await.map_err(auth_err)?;
+            let r = h
+                .authenticate_password(user, pw)
+                .await
+                .map_err(connect_err)?;
             match step(&mut methods, &r) {
                 Step::Done => return Ok(()),
                 Step::Partial => accepted = true,
@@ -414,7 +450,7 @@ async fn authenticate<P: Prompter, S: SecretStore>(
             let r = h
                 .authenticate_password(user, s.value.clone())
                 .await
-                .map_err(auth_err)?;
+                .map_err(connect_err)?;
             let result = step(&mut methods, &r);
             if result != Step::Failed && s.remember {
                 let _ = secrets.set(&key, &s.value);
@@ -480,7 +516,7 @@ where
         let hash = h
             .best_supported_rsa_hash()
             .await
-            .map_err(auth_err)?
+            .map_err(connect_err)?
             .flatten();
         if let Ok(r) = h
             .authenticate_publickey_with(user, key, hash, &mut agent)
@@ -522,7 +558,7 @@ async fn keyboard_interactive<P: Prompter>(
     let mut reply = h
         .authenticate_keyboard_interactive_start(spec.user.clone(), None)
         .await
-        .map_err(auth_err)?;
+        .map_err(connect_err)?;
     loop {
         match reply {
             KeyboardInteractiveAuthResponse::Success => return Ok(true),
@@ -553,7 +589,7 @@ async fn keyboard_interactive<P: Prompter>(
                 reply = h
                     .authenticate_keyboard_interactive_respond(answers)
                     .await
-                    .map_err(auth_err)?;
+                    .map_err(connect_err)?;
             }
         }
     }
