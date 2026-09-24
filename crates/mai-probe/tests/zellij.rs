@@ -1,7 +1,8 @@
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use mai_probe::zellij::{
-    find_zellij, parse_panes, parse_sessions, parse_version, sessions_from_output,
+    default_dirs, find_zellij_in, parse_panes, parse_sessions, parse_version, sessions_from_output,
 };
 use mai_protocol::{PaneInfo, SessionInfo};
 
@@ -131,26 +132,44 @@ fn touch(path: &std::path::Path) {
     std::fs::write(path, b"").unwrap();
 }
 
+/// Uses temp dirs only, so the result does not depend on whether the host
+/// has zellij installed in a common location (e.g. Homebrew on macOS).
 #[test]
-fn find_prefers_explicit_then_path_then_home_dirs() {
+fn find_prefers_explicit_then_path_then_candidate_dirs() {
     let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
     let in_path = tmp.path().join("bin").join("zellij");
-    let in_cargo = home.join(".cargo").join("bin").join("zellij");
+    let first_dir = tmp.path().join("first");
+    let second_dir = tmp.path().join("second");
+    let in_second = second_dir.join("zellij");
     let explicit = tmp.path().join("custom").join("zellij.exe");
     touch(&in_path);
-    touch(&in_cargo);
+    touch(&in_second);
     touch(&explicit);
     let path_env: OsString =
         std::env::join_paths([tmp.path().join("empty"), tmp.path().join("bin")]).unwrap();
+    let dirs = [first_dir, second_dir];
 
     assert_eq!(
-        find_zellij(Some(&explicit), Some(&path_env), &home),
+        find_zellij_in(Some(&explicit), Some(&path_env), &dirs),
         Some(explicit.clone())
     );
-    assert_eq!(find_zellij(None, Some(&path_env), &home), Some(in_path));
-    assert_eq!(find_zellij(None, None, &home), Some(in_cargo));
+    assert_eq!(find_zellij_in(None, Some(&path_env), &dirs), Some(in_path));
+    assert_eq!(find_zellij_in(None, None, &dirs), Some(in_second));
     let missing = tmp.path().join("missing");
-    assert_eq!(find_zellij(Some(&missing), Some(&path_env), &home), None);
-    assert_eq!(find_zellij(None, None, &tmp.path().join("nohome")), None);
+    assert_eq!(find_zellij_in(Some(&missing), Some(&path_env), &dirs), None);
+    assert_eq!(find_zellij_in(None, None, &[tmp.path().join("none")]), None);
+}
+
+#[test]
+fn default_dirs_order_matches_design() {
+    let home = PathBuf::from("h");
+    assert_eq!(
+        default_dirs(&home),
+        vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            home.join(".cargo").join("bin"),
+            home.join(".local").join("bin"),
+        ]
+    );
 }

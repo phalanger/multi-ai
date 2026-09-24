@@ -124,6 +124,26 @@ pub fn find_zellij(
     path_env: Option<&OsStr>,
     home: &Path,
 ) -> Option<PathBuf> {
+    find_zellij_in(explicit, path_env, &default_dirs(home))
+}
+
+/// Common install dirs checked after `PATH`, in order.
+pub fn default_dirs(home: &Path) -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        home.join(".cargo").join("bin"),
+        home.join(".local").join("bin"),
+    ]
+}
+
+/// `find_zellij` with an explicit candidate-dir list (testable without
+/// depending on what the host has installed).
+pub fn find_zellij_in(
+    explicit: Option<&Path>,
+    path_env: Option<&OsStr>,
+    dirs: &[PathBuf],
+) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return p.is_file().then(|| p.to_path_buf());
     }
@@ -131,16 +151,7 @@ pub fn find_zellij(
         .into_iter()
         .flat_map(std::env::split_paths)
         .find_map(|d| exe_in(&d));
-    from_path.or_else(|| {
-        [
-            PathBuf::from("/opt/homebrew/bin"),
-            PathBuf::from("/usr/local/bin"),
-            home.join(".cargo").join("bin"),
-            home.join(".local").join("bin"),
-        ]
-        .iter()
-        .find_map(|d| exe_in(d))
-    })
+    from_path.or_else(|| dirs.iter().find_map(|d| exe_in(d)))
 }
 
 /// Last resort on Unix: ask the user's login shell.
