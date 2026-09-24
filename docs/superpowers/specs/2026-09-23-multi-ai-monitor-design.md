@@ -172,6 +172,7 @@ multi-ai 是一个基于 Tauri 2 的桌面应用（macOS / Windows）。它通�
 | `SendText` | session、pane_id、text；探针执行 `zellij action paste -p`（第二期使用） |
 | `Focus` | session、pane_id、tab_id；执行 go-to-tab-by-id 与 focus-pane-id（见 8.2） |
 | `SetInterval` | 调整 pane 轮询、抓屏、指标采集间隔 |
+| `SetRules` | 下发抓屏规则（见 6.2），探针收到后立即替换 |
 
 ## 6. Agent 识别与状态机
 
