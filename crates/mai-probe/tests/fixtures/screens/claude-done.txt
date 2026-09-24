@@ -1,0 +1,66 @@
+
+ ▐▛███▛█   Claude Code v2.1.281
+▝▜██████▀  Opus 5.5 · Claude Pro
+  ▝▝ ▝▝    G:\work\ai\multi-ai\spikes\claude-playground
+
+  Updated to latest. Got 13 features, 70 bugfixes, and 33 other changes.
+  code.claude.com/docs/en/changelog for details
+
+▎ Auto mode is now Claude Code's default permission mode.
+▎ Auto mode lets Claude handle permission prompts automatically. Claude checks each tool call for risky actions and prompt injection
+▎ before executing, runs the ones it assesses as lower-risk, and blocks the rest.
+▎ https://code.claude.com/docs/en/permission-modes
+  1 more notice hidden
+
+❯ Count from 1 to 40, one number per line, no tools.
+
+● 1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+  10
+  11
+  12
+  13
+  14
+  15
+  16
+  17
+  18
+  19
+  20
+  21
+  22
+  23
+  24
+  25
+  26
+  27
+  28
+  29
+  30
+  31
+  32
+  33
+  34
+  35
+  36
+  37
+  38
+  39
+  40
+
+✻ Cooked for 3s · done 19:48
+
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 t…
+  [Opus 5.5] │ claude-playground git:(spike/00)
+  Context ░░░░░░░░░░ 4% │ Usage ████░░░░░░ 40% (resets in 3h 22m) | Weekly █░░░░░░░░░ 11% (resets in 1d 5h)
+  1 CLAUDE.md | 7 hooks
+  ⏸ manual mode on

@@ -9,6 +9,7 @@ fn rules() -> CompiledRules {
             screen_patterns: vec![r"FAKE AGENT v\d".into()],
             needs_input_patterns: vec![r"(?m)^Allow\? \[y/n\]".into()],
             done_patterns: vec![r"(?m)^> $".into()],
+            ignore_patterns: vec![],
             stable_ms: 5_000,
         }],
     })
@@ -40,6 +41,7 @@ fn compile_rejects_bad_regex() {
             screen_patterns: vec![],
             needs_input_patterns: vec![],
             done_patterns: vec![],
+            ignore_patterns: vec![],
             stable_ms: 1,
         }],
     };

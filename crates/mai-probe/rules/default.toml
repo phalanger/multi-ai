@@ -1,0 +1,44 @@
+# Default screen-scrape rules pushed to mai-probe.
+# Regex syntax: Rust `regex` crate. Literal strings ('...') keep
+# backslashes as-is. Non-ASCII characters are written as \x{....}.
+# Derived from spike screen samples (docs/superpowers/spike-data/screens).
+
+[[agents]]
+name = "claude"
+stable_ms = 5000
+# Claude sets the terminal title to "<spinner> Claude Code"; the pane
+# command is the running foreground process (e.g. "claude.exe -c").
+title_patterns = ['(?i)(^|[\\/ ])claude(\.exe)?( |$)', 'Claude Code']
+screen_patterns = [
+    '(manual|auto) mode on',
+    'accept edits on',
+    'plan mode on',
+    'bypass permissions on',
+    'shift\+tab to cycle',
+    'Esc to cancel \x{00B7} Tab to amend',
+]
+needs_input_patterns = [
+    'Do you want to proceed\?',
+    'Esc to cancel \x{00B7} Tab to amend',
+]
+done_patterns = ['\x{00B7} done \d{1,2}:\d{2}']
+# Status-line clocks and throughput (e.g. claude-hud) change while idle.
+ignore_patterns = ['(?m)^.*(resets in|tok/s).*$']
+
+[[agents]]
+name = "codex"
+stable_ms = 5000
+title_patterns = ['(?i)(^|[\\/ ])codex(\.js|\.exe)?( |$)']
+screen_patterns = [
+    'Ask Codex to do anything',
+    'Context \d+% used',
+    'OpenAI Codex \(v',
+    'Press enter to confirm or esc to cancel',
+]
+needs_input_patterns = [
+    'Would you like to run the following command\?',
+    'Press enter to confirm or esc to cancel',
+]
+done_patterns = ['(?m)^\s*done \d{1,2}:\d{2}', 'Conversation interrupted']
+# Idle background animation uses braille dots mixed into the input line.
+ignore_patterns = ['[\x{2800}-\x{28FF}]']
