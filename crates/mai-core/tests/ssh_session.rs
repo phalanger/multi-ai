@@ -116,6 +116,12 @@ impl server::Handler for TestServer {
 
 /// Start a server on 127.0.0.1:<random>; returns its port and host key.
 async fn start(cfg: ServerCfg) -> (u16, PublicKey) {
+    start_after(cfg, Duration::ZERO).await
+}
+
+/// Like `start`, but each accepted connection waits `delay` before the SSH
+/// handshake (a slow server).
+async fn start_after(cfg: ServerCfg, delay: Duration) -> (u16, PublicKey) {
     let host_key = random_key();
     let public = host_key.public_key().clone();
     let config = Arc::new(server::Config {
@@ -129,7 +135,11 @@ async fn start(cfg: ServerCfg) -> (u16, PublicKey) {
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            let _ = server::run_stream(config.clone(), stream, TestServer(cfg.clone())).await;
+            let (config, cfg) = (config.clone(), cfg.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = server::run_stream(config, stream, TestServer(cfg)).await;
+            });
         }
     });
     (port, public)
@@ -529,4 +539,38 @@ async fn slow_host_key_answer_does_not_time_out() {
         .await
         .unwrap();
     assert_eq!(p.calls(), vec!["host_key", "password"]);
+}
+
+/// A connection that timed out before the host-key prompt must never
+/// prompt or record the key later (the russh session task is detached and
+/// keeps running after `connect` gives up).
+#[tokio::test]
+async fn timed_out_connection_never_prompts_later() {
+    let (port, _) = start_after(
+        ServerCfg {
+            methods: vec![MethodKind::Password],
+            client_key: None,
+        },
+        Duration::from_millis(600),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.timeout = Duration::from_millis(200);
+    let p = Arc::new(Scripted {
+        trust: true,
+        password: secret(PASSWORD, false),
+        ..Default::default()
+    });
+    let err = connect(&spec(port, vec![]), &o, p.clone(), &MemStore::default())
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, SshError::Connect(ref m) if m.contains("timed out")),
+        "{err:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(p.calls().is_empty(), "{:?}", p.calls());
+    assert!(!dir.path().join("known_hosts").exists());
 }

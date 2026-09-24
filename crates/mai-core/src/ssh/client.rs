@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -93,15 +93,28 @@ fn auth_err(e: impl fmt::Display) -> SshError {
 /// Why a host key was refused, filled in by the handler.
 type Verdict = Arc<Mutex<Option<SshError>>>;
 
+const IDLE: u8 = 0;
+const PROMPTING: u8 = 1;
+const ABANDONED: u8 = 2;
+
+/// Coordination between the connect timeout and the host-key prompt.
+/// `phase` moves IDLE -> PROMPTING -> IDLE (handler) or IDLE -> ABANDONED
+/// (timeout); both use compare-and-swap, so a timed-out connection never
+/// prompts or learns a key, and a prompt is never cut short by the timer.
+#[derive(Default)]
+struct HopState {
+    phase: AtomicU8,
+    /// Incremented when a prompt finishes; the timer then starts afresh.
+    prompts_done: AtomicU64,
+}
+
 pub struct Checker<P> {
     host: String,
     port: u16,
     opts: ConnectOptions,
     prompter: Arc<P>,
     verdict: Verdict,
-    /// True while the user is answering the host-key prompt; the connect
-    /// timeout does not count that time.
-    prompting: Arc<AtomicBool>,
+    state: Arc<HopState>,
 }
 
 impl<P: Prompter> client::Handler for Checker<P> {
@@ -129,26 +142,41 @@ impl<P: Prompter> client::Handler for Checker<P> {
                 Ok(false)
             }
             HostKeyStatus::Unknown => {
+                let claimed = self.state.phase.compare_exchange(
+                    IDLE,
+                    PROMPTING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                if claimed.is_err() {
+                    // The connection already timed out: do not prompt.
+                    return Ok(false);
+                }
                 let fp = hostkey::fingerprint(key);
-                self.prompting.store(true, Ordering::SeqCst);
                 let trusted = self
                     .prompter
                     .confirm_host_key(&self.host, self.port, &fp)
                     .await;
-                self.prompting.store(false, Ordering::SeqCst);
-                if !trusted {
+                // Decide and learn while still PROMPTING, so the timer
+                // cannot abandon the connection in between.
+                let accepted = if !trusted {
                     self.refuse(SshError::HostKeyRejected {
                         host: self.host.clone(),
                         port: self.port,
                         fingerprint: fp,
                     });
-                    return Ok(false);
-                }
-                if let Err(e) = hostkey::learn(&self.opts.learn_to, &self.host, self.port, key) {
+                    false
+                } else if let Err(e) =
+                    hostkey::learn(&self.opts.learn_to, &self.host, self.port, key)
+                {
                     self.refuse(SshError::Connect(format!("cannot record host key: {e}")));
-                    return Ok(false);
-                }
-                Ok(true)
+                    false
+                } else {
+                    true
+                };
+                self.state.prompts_done.fetch_add(1, Ordering::SeqCst);
+                self.state.phase.store(IDLE, Ordering::SeqCst);
+                Ok(accepted)
             }
         }
     }
@@ -218,14 +246,14 @@ async fn connect_hop<P: Prompter, S: SecretStore>(
     via: Option<SshSession<P>>,
 ) -> Result<SshSession<P>, SshError> {
     let verdict: Verdict = Arc::default();
-    let prompting = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(HopState::default());
     let checker = Checker {
         host: hop.host.clone(),
         port: hop.port,
         opts: opts.clone(),
         prompter: prompter.clone(),
         verdict: verdict.clone(),
-        prompting: prompting.clone(),
+        state: state.clone(),
     };
     let result = {
         let connecting = async {
@@ -247,14 +275,28 @@ async fn connect_hop<P: Prompter, S: SecretStore>(
                 }
             }
         };
-        // The timeout covers TCP connect and key exchange; while the user
-        // is answering the host-key prompt the timer is re-armed instead.
+        // The timeout covers TCP connect and key exchange only: it waits
+        // while the host-key prompt is open, and starts a full period again
+        // after a prompt finishes. Giving up marks the hop ABANDONED so the
+        // detached russh session task can no longer prompt or learn a key.
         tokio::pin!(connecting);
+        let mut seen = state.prompts_done.load(Ordering::SeqCst);
         loop {
             tokio::select! {
                 r = &mut connecting => break r,
                 _ = tokio::time::sleep(opts.timeout) => {
-                    if !prompting.load(Ordering::SeqCst) {
+                    let done = state.prompts_done.load(Ordering::SeqCst);
+                    if done != seen {
+                        seen = done;
+                        continue;
+                    }
+                    let gave_up = state.phase.compare_exchange(
+                        IDLE,
+                        ABANDONED,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                    if gave_up.is_ok() {
                         return Err(SshError::Connect(format!(
                             "{}:{} timed out",
                             hop.host, hop.port
