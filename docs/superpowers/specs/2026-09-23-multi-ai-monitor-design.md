@@ -131,8 +131,12 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 2. 以远程命令计算 `<home>/.mai/bin/mai-probe` 的 SHA-256
    （`sha256sum`、`shasum -a 256`、`certutil`、`Get-FileHash`），
    与应用内置二进制比较；一致则跳过上传。
-3. 不一致或不存在：SFTP 上传到临时名，校验后原子重命名；SFTP 不可用则回退 exec 写入。
+3. 不一致或不存在：SFTP 上传到 `<exe>.upload`；非 Windows 上 chmod 0755；
+   若目标文件已存在则先删除，再将 `<exe>.upload` 重命名为目标名。
    SFTP 路径相对登录目录（`.mai/bin/...`）；内置二进制来自 CI 产物 `probes/<target>/`。
+   上传后的校验、以及 SFTP 不可用时回退 exec 写入均尚未实现；
+   “先删后 rename”之间还有一段窗口不是原子的，见
+   `docs/superpowers/plans/2026-09-24-02-followups.md`（B18）。
 4. 执行 `mai-probe install-hooks`（幂等）。
 5. 执行 `mai-probe serve`。
 
