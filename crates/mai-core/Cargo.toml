@@ -7,7 +7,9 @@ edition.workspace = true
 keyring = "4"
 mai-protocol = { workspace = true }
 russh = { version = "0.63", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "3"
 ssh2-config = "0.8"
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 ssh-key = { version = "=0.7.0-rc.11", features = ["getrandom", "ed25519", "encryption"] }
