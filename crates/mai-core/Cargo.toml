@@ -15,6 +15,7 @@ ssh2-config = "0.8"
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
+rpassword = "7"
 ssh-key = { version = "=0.7.0-rc.11", features = ["getrandom", "ed25519", "encryption"] }
 tempfile = "3"
 
