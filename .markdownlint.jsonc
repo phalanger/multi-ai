@@ -1,0 +1,5 @@
+// markdownlint-cli2 config for this repo.
+{
+  // Code blocks hold rustfmt-formatted code (max width 100); do not wrap them.
+  "MD013": { "code_blocks": false }
+}
