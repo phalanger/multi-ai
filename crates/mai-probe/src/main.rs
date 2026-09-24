@@ -11,7 +11,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use mai_probe::install::{
-    CLAUDE_EVENTS, CODEX_EVENTS, Outcome, hook_command, install_file, uninstall_file,
+    CLAUDE_EVENTS, CODEX_EVENTS, Outcome, check_probe_exe, hook_command, install_file,
+    uninstall_file,
 };
 use mai_probe::rules::{default_rules, parse_rules};
 use mai_probe::run::{now_ms, run};
@@ -145,6 +146,15 @@ fn cmd_hooks(home: &Path, install: bool) -> ExitCode {
         ),
         ("codex", home.join(".codex"), "hooks.json", CODEX_EVENTS),
     ];
+    if install && let Err(e) = check_probe_exe(&exe) {
+        for (agent, ..) in targets {
+            println!(
+                "{}",
+                json!({"agent": agent, "outcome": "error", "error": e})
+            );
+        }
+        return ExitCode::FAILURE;
+    }
     let mut ok = true;
     for (agent, dir, file, events) in targets {
         let path = dir.join(file);

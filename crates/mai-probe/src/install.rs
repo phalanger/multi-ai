@@ -70,6 +70,20 @@ pub fn hook_command(probe_exe: &Path, agent: &str) -> String {
     format!("\"{exe}\" hook {agent}")
 }
 
+/// Hooks are recognised as ours only by `MARKER` in the command, so the
+/// probe must run from an absolute path under `.mai/bin`. Otherwise
+/// uninstall could not find the entries and a reinstall would duplicate
+/// them. Not canonicalized: Windows `\\?\` paths would break the command.
+pub fn check_probe_exe(exe: &Path) -> Result<(), &'static str> {
+    if !exe.is_absolute() {
+        return Err("probe path is not absolute");
+    }
+    if !hook_command(exe, "x").contains(MARKER) {
+        return Err("probe is not under .mai/bin; hooks would not be recognised");
+    }
+    Ok(())
+}
+
 fn is_ours(entry: &Value) -> bool {
     entry
         .get("hooks")

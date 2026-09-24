@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use mai_probe::install::{
-    CLAUDE_EVENTS, CODEX_EVENTS, InstallError, Outcome, hook_command, install_file, merge_hooks,
-    remove_hooks, uninstall_file,
+    CLAUDE_EVENTS, CODEX_EVENTS, InstallError, Outcome, check_probe_exe, hook_command,
+    install_file, merge_hooks, remove_hooks, uninstall_file,
 };
 use serde_json::{Value, json};
 
@@ -138,5 +138,28 @@ fn uninstall_restores_user_content() {
     assert_eq!(
         uninstall_file(&dir.path().join("none.json"), 4).unwrap(),
         Outcome::Unchanged
+    );
+}
+
+#[test]
+fn probe_exe_must_be_absolute_and_under_mai_bin() {
+    let good = if cfg!(windows) {
+        "C:\\Users\\x\\.mai\\bin\\mai-probe.exe"
+    } else {
+        "/home/x/.mai/bin/mai-probe"
+    };
+    assert_eq!(check_probe_exe(Path::new(good)), Ok(()));
+    assert_eq!(
+        check_probe_exe(Path::new(".mai/bin/mai-probe")),
+        Err("probe path is not absolute")
+    );
+    let dev = if cfg!(windows) {
+        "C:\\work\\multi-ai\\target\\debug\\mai-probe.exe"
+    } else {
+        "/home/x/multi-ai/target/debug/mai-probe"
+    };
+    assert_eq!(
+        check_probe_exe(Path::new(dev)),
+        Err("probe is not under .mai/bin; hooks would not be recognised")
     );
 }
