@@ -1,0 +1,81 @@
+# Tests on Linux, macOS and Windows; builds mai-probe for every target the
+# app deploys to and bundles them as the `probes` artifact
+# (layout: probes/<target>/mai-probe[.exe]).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  probe:
+    name: probe (${{ matrix.target }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build -p mai-probe --release --locked --target ${{ matrix.target }}
+      - name: stage
+        shell: bash
+        run: |
+          exe=mai-probe
+          case "${{ matrix.target }}" in *windows*) exe=mai-probe.exe;; esac
+          mkdir -p "out/${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/$exe" "out/${{ matrix.target }}/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.target }}
+          path: out/
+          if-no-files-found: error
+
+  probes:
+    name: probes bundle
+    needs: probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: probe-*
+          path: probes
+          merge-multiple: true
+      - run: find probes -type f -exec ls -l {} \;
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probes
+          path: probes/
+          if-no-files-found: error
