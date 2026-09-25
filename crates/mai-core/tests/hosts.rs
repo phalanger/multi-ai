@@ -12,6 +12,9 @@ use mai_core::host::{
     OpenError, Opened, Problem, STABLE_AFTER, host_state, run_host,
 };
 use mai_core::link::ProbeIo;
+use mai_core::manager::HostManager;
+use mai_core::monitor::Update;
+use mai_core::tracker::{AgentKey, TrackerConfig};
 use mai_protocol::{
     AgentEvent, AgentState, AppMsg, EventSource, PROTOCOL_VERSION, PaneRef, ProbeMsg, decode_line,
     encode_line,
@@ -374,4 +377,107 @@ async fn stop_ends_the_task_even_while_connecting() {
         .await
         .expect("task ended")
         .unwrap();
+}
+
+async fn next_update(rx: &mut UnboundedReceiver<Update>) -> Update {
+    timeout(Duration::from_secs(600), rx.recv())
+        .await
+        .expect("update")
+        .expect("monitor alive")
+}
+
+/// Skip updates until `f` matches one.
+async fn until<T>(rx: &mut UnboundedReceiver<Update>, f: impl Fn(&Update) -> Option<T>) -> T {
+    loop {
+        if let Some(t) = f(&next_update(rx).await) {
+            return t;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn manager_turns_probe_events_into_updates() {
+    let (c, mut probes) = Scripted::new(vec![Step::Probe]);
+    let (mut mgr, mut rx) = HostManager::start(c, TrackerConfig::default());
+    assert!(mgr.add_host(cfg("h")));
+    assert!(!mgr.add_host(cfg("h")), "duplicate id");
+    assert_eq!(mgr.host_ids(), vec!["h".to_owned()]);
+
+    let mut probe = probes.recv().await.unwrap();
+    probe.hello(PROTOCOL_VERSION).await;
+    let state = until(&mut rx, |u| match u {
+        Update::Host { state, .. } if *state == HostState::Online => Some(*state),
+        _ => None,
+    })
+    .await;
+    assert_eq!(state, HostState::Online);
+
+    probe.send(&hook_event(7, AgentState::NeedsInput)).await;
+    let alert = until(&mut rx, |u| match u {
+        Update::Alert(a) => Some(a.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(alert.state, AgentState::NeedsInput);
+    assert_eq!(probe.heard().await, AppMsg::Ack { spool_offset: 7 });
+
+    mgr.acknowledge(AgentKey {
+        host_id: "h".into(),
+        session: "w".into(),
+        pane_id: 1,
+    });
+    let acked = until(&mut rx, |u| match u {
+        Update::Agent(r) => Some(r.acknowledged),
+        _ => None,
+    })
+    .await;
+    assert!(acked);
+
+    assert!(mgr.send(
+        "h",
+        AppMsg::SendText {
+            session: "w".into(),
+            pane_id: 1,
+            text: "yes".into()
+        }
+    ));
+    assert!(matches!(probe.heard().await, AppMsg::SendText { text, .. } if text == "yes"));
+    assert!(!mgr.send("nope", AppMsg::Ack { spool_offset: 1 }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_host_can_be_added_again() {
+    let (c, mut probes) = Scripted::new(vec![Step::Probe, Step::Probe]);
+    let (mut mgr, mut rx) = HostManager::start(c.clone(), TrackerConfig::default());
+    mgr.add_host(cfg("h"));
+    let _first = probes.recv().await.unwrap();
+    assert!(mgr.remove_host("h"));
+    assert!(!mgr.remove_host("h"));
+    assert!(mgr.host_ids().is_empty());
+
+    assert!(mgr.add_host(cfg("h")));
+    let mut second = probes.recv().await.unwrap();
+    second.hello(PROTOCOL_VERSION).await;
+    let state = until(&mut rx, |u| match u {
+        Update::Host { state, .. } if *state == HostState::Online => Some(*state),
+        _ => None,
+    })
+    .await;
+    assert_eq!(state, HostState::Online);
+    assert_eq!(c.opens(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_the_manager_ends_the_update_stream() {
+    let (c, _probes) = Scripted::new(vec![]);
+    let (mut mgr, mut rx) = HostManager::start(c, TrackerConfig::default());
+    mgr.add_host(cfg("h"));
+    drop(mgr);
+    loop {
+        match timeout(Duration::from_secs(60), rx.recv()).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => panic!("update stream did not end"),
+        }
+    }
 }

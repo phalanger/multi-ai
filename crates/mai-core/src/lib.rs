@@ -3,5 +3,7 @@
 pub mod deploy;
 pub mod host;
 pub mod link;
+pub mod manager;
+pub mod monitor;
 pub mod ssh;
 pub mod tracker;

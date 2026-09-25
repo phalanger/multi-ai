@@ -172,6 +172,11 @@ impl Tracker {
         self.agents.get(key)
     }
 
+    /// Every tracked agent, in no particular order.
+    pub fn records(&self) -> impl Iterator<Item = &AgentRecord> {
+        self.agents.values()
+    }
+
     /// Unacknowledged alerting agents: NeedsInput first, then Done,
     /// each group oldest first.
     pub fn pending(&self) -> Vec<&AgentRecord> {
