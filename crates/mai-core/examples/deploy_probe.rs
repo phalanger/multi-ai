@@ -33,6 +33,7 @@ async fn main() {
     let opts = DeployOptions {
         dir,
         install_hooks: false,
+        client: String::new(),
     };
     let report = match deploy(&session, &ProbeStore { dir: probes }, &opts).await {
         Ok(r) => r,

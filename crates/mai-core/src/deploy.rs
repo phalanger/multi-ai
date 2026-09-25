@@ -5,6 +5,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use mai_protocol::sanitize_client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -80,6 +81,42 @@ impl Remote {
             Shell::Cmd => format!("\"{path}\" {args}"),
             Shell::PowerShell => format!("& '{}' {args}", path.replace('\'', "''")),
         }
+    }
+
+    /// Quote one argument for this host's shell. Under cmd the value is
+    /// wrapped in double quotes without escaping (Windows paths cannot
+    /// contain `"`).
+    pub fn quote_arg(&self, arg: &str) -> String {
+        match self.shell {
+            Shell::Posix => sh_quote(arg),
+            Shell::Cmd => format!("\"{arg}\""),
+            Shell::PowerShell => format!("'{}'", arg.replace('\'', "''")),
+        }
+    }
+
+    /// Join `argv` for this host's shell, quoting every word that is not
+    /// plain `[A-Za-z0-9_-]`.
+    pub fn join_args(&self, argv: &[String]) -> String {
+        let plain = |w: &str| {
+            !w.is_empty()
+                && w.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        };
+        argv.iter()
+            .map(|w| {
+                if plain(w) {
+                    w.clone()
+                } else {
+                    self.quote_arg(w)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// `serve_argv` joined for this host's shell.
+    pub fn serve_args(&self, client: &str, zellij: Option<&str>) -> String {
+        self.join_args(&serve_argv(client, zellij))
     }
 
     /// Command printing the SHA-256 of `path` (parse with `parse_hash`).
@@ -200,6 +237,9 @@ pub struct DeployOptions {
     /// only recognised under `.mai/bin`).
     pub dir: String,
     pub install_hooks: bool,
+    /// App installation id; its running `serve` is stopped before the
+    /// binary is replaced (a running probe locks its file on Windows).
+    pub client: String,
 }
 
 impl Default for DeployOptions {
@@ -207,8 +247,44 @@ impl Default for DeployOptions {
         Self {
             dir: ".mai".into(),
             install_hooks: true,
+            client: String::new(),
         }
     }
+}
+
+/// Arguments of `mai-probe stop` for `client` (see `Remote::serve_args`).
+pub fn stop_args(client: &str) -> String {
+    stop_argv(client).join(" ")
+}
+
+/// `--client <id>` with the id reduced to `[A-Za-z0-9_-]`; nothing for
+/// an empty id (PowerShell 5.1 drops empty arguments to native programs).
+fn client_argv(client: &str) -> Vec<String> {
+    let client = sanitize_client(client);
+    if client.is_empty() {
+        Vec::new()
+    } else {
+        vec!["--client".to_owned(), client]
+    }
+}
+
+/// Arguments of `mai-probe serve` for `client`, with an optional
+/// zellij path.
+pub fn serve_argv(client: &str, zellij: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["serve".to_owned()];
+    argv.extend(client_argv(client));
+    if let Some(z) = zellij {
+        argv.push("--zellij".to_owned());
+        argv.push(z.to_owned());
+    }
+    argv
+}
+
+/// Arguments of `mai-probe stop` for `client`.
+pub fn stop_argv(client: &str) -> Vec<String> {
+    let mut argv = vec!["stop".to_owned()];
+    argv.extend(client_argv(client));
+    argv
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +461,12 @@ pub async fn deploy<P: Prompter>(
     );
     let uploaded = remote_hash.as_deref() != Some(sha256_hex(&bytes).as_str());
     if uploaded {
+        if remote_hash.is_some() {
+            // Best effort: an older probe may not know `stop`.
+            let _ = s
+                .exec(&remote.invoke(&probe_path, &stop_args(&opts.client)))
+                .await;
+        }
         upload(s, &remote, &opts.dir, &bytes).await?;
     }
     let hooks = if opts.install_hooks {

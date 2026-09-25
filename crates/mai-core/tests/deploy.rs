@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use mai_core::deploy::{
     DeployError, HookResult, Os, ProbeStore, Remote, Shell, hooks_result, normalize_arch,
-    parse_hash, parse_hook_lines, parse_uname, sha256_hex,
+    parse_hash, parse_hook_lines, parse_uname, sha256_hex, stop_args,
 };
 use mai_core::ssh::client::ExecOutput;
 
@@ -203,4 +203,26 @@ fn successful_install_hooks_parses_output() {
     let hooks = hooks_result(&out).unwrap();
     assert_eq!(hooks.len(), 1);
     assert_eq!(hooks[0].agent, "claude");
+}
+
+#[test]
+fn serve_and_stop_arguments_are_quoted_per_shell() {
+    let posix = remote(Os::Linux, Shell::Posix, "/home/u");
+    assert_eq!(
+        posix.serve_args("mac-1", Some("/opt/it's/zellij")),
+        r"serve --client mac-1 --zellij '/opt/it'\''s/zellij'"
+    );
+    let cmd = remote(Os::Windows, Shell::Cmd, r"C:\Users\u");
+    assert_eq!(
+        cmd.serve_args("a b", Some(r"C:\Program Files\zellij.exe")),
+        r#"serve --client ab --zellij "C:\Program Files\zellij.exe""#
+    );
+    let ps = remote(Os::Windows, Shell::PowerShell, r"C:\Users\u");
+    assert_eq!(
+        ps.serve_args("", Some(r"C:\o'k\z.exe")),
+        r"serve --zellij 'C:\o''k\z.exe'"
+    );
+    assert_eq!(posix.serve_args("", None), "serve");
+    assert_eq!(stop_args("mac-1"), "stop --client mac-1");
+    assert_eq!(stop_args("../"), "stop");
 }
