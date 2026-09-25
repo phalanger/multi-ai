@@ -1,5 +1,6 @@
 //! UI-independent core of the multi-ai app.
 
+pub mod connect;
 pub mod deploy;
 pub mod host;
 pub mod link;
