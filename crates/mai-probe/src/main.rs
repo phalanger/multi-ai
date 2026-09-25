@@ -8,12 +8,14 @@ use std::env;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use mai_probe::install::{
     CLAUDE_EVENTS, CODEX_EVENTS, Outcome, check_probe_exe, hook_command, install_file,
     uninstall_file,
 };
+use mai_probe::instance::{data_dir, forget_self, pid_file, record_self, stop_recorded};
 use mai_probe::rules::{default_rules, parse_rules};
 use mai_probe::run::{now_ms, run};
 use mai_probe::serve::Server;
@@ -22,7 +24,8 @@ use mai_probe::zellij::{CliZellij, find_via_login_shell, find_zellij};
 use mai_protocol::{AgentState, PROTOCOL_VERSION, ProbeMsg};
 use serde_json::{Value, json};
 
-const SPOOL_KEEP_DAYS: u64 = 7;
+/// How long a new `serve` (or `stop`) waits for the old one to exit.
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Parser)]
 #[command(name = "mai-probe", version, about = "multi-ai remote probe")]
@@ -41,6 +44,14 @@ enum Cmd {
         /// Scrape rules TOML; default: built-in rules.
         #[arg(long)]
         rules: Option<PathBuf>,
+        /// App installation id: one serve and one ack cursor per client.
+        #[arg(long, default_value = "")]
+        client: String,
+    },
+    /// Stop the running serve of a client (used before redeploying).
+    Stop {
+        #[arg(long, default_value = "")]
+        client: String,
     },
     /// Called by agent hooks: record one event (JSON payload on stdin).
     Hook { agent: String },
@@ -71,10 +82,10 @@ fn home_dir() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-/// Probe data dir: `$MAI_HOME` if set, else `<home>/.mai`.
-fn spool(home: &Path) -> Spool {
-    let mai = env::var_os("MAI_HOME").map_or_else(|| home.join(".mai"), PathBuf::from);
-    Spool::new(spool_dir(&mai))
+/// Probe data dir; see `instance::data_dir`.
+fn data(home: &Path) -> PathBuf {
+    let exe = env::current_exe().ok();
+    data_dir(exe.as_deref(), env::var_os("MAI_HOME").as_deref(), home)
 }
 
 /// Spool record for the zellij pane this process runs in, if any.
@@ -105,7 +116,7 @@ fn cmd_hook(home: &Path, agent: &str) {
     let Some(rec) = record_here(agent, payload) else {
         return; // not inside a zellij pane: nothing to track
     };
-    if let Err(e) = spool(home).append(&rec) {
+    if let Err(e) = Spool::new(spool_dir(&data(home))).append(&rec) {
         eprintln!("mai-probe hook: spool: {e}");
     }
 }
@@ -119,7 +130,7 @@ fn cmd_emit(home: &Path, agent: &str, state: &str, msg: Option<String>) -> ExitC
         eprintln!("mai-probe emit: not inside a zellij pane (ZELLIJ_PANE_ID unset)");
         return ExitCode::FAILURE;
     };
-    match spool(home).append(&rec) {
+    match Spool::new(spool_dir(&data(home))).append(&rec) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("mai-probe emit: spool: {e}");
@@ -195,13 +206,29 @@ fn cmd_hooks(home: &Path, install: bool) -> ExitCode {
     }
 }
 
-fn cmd_serve(home: &Path, zellij: Option<PathBuf>, rules: Option<PathBuf>) -> io::Result<()> {
+/// Prints `{"stopped": <pid or null>}`; always succeeds.
+fn cmd_stop(home: &Path, client: &str) -> ExitCode {
+    let stopped = stop_recorded(&pid_file(&data(home), client), STOP_WAIT);
+    println!("{}", json!({ "stopped": stopped }));
+    ExitCode::SUCCESS
+}
+
+fn cmd_serve(
+    home: &Path,
+    zellij: Option<PathBuf>,
+    rules: Option<PathBuf>,
+    client: &str,
+) -> io::Result<()> {
     let rules = match rules {
         None => default_rules(),
         Some(p) => parse_rules(&std::fs::read_to_string(&p)?).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", p.display()))
         })?,
     };
+    let data = data(home);
+    let pids = pid_file(&data, client);
+    stop_recorded(&pids, STOP_WAIT);
+    record_self(&pids)?;
     // An explicit `--zellij` that does not exist is reported as missing,
     // not replaced by whatever the login shell finds.
     let exe = find_zellij(zellij.as_deref(), env::var_os("PATH").as_deref(), home).or_else(|| {
@@ -217,18 +244,19 @@ fn cmd_serve(home: &Path, zellij: Option<PathBuf>, rules: Option<PathBuf>) -> io
         zellij_path: exe.map(|p| p.display().to_string()),
         zellij_version: cli.as_ref().and_then(|c| c.version().ok()),
     };
-    let spool = spool(home);
-    if let Err(e) = spool.cleanup(now_ms(), SPOOL_KEEP_DAYS) {
-        eprintln!("mai-probe serve: spool cleanup: {e}");
-    }
-    let server = Server::new(cli, spool, &rules)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    run(
-        server,
-        hello,
-        BufReader::new(io::stdin()),
-        io::stdout().lock(),
-    )
+    let spool = Spool::for_client(spool_dir(&data), client);
+    let result = Server::new(cli, spool, &rules)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+        .and_then(|server| {
+            run(
+                server,
+                hello,
+                BufReader::new(io::stdin()),
+                io::stdout().lock(),
+            )
+        });
+    forget_self(&pids);
+    result
 }
 
 fn main() -> ExitCode {
@@ -244,13 +272,18 @@ fn main() -> ExitCode {
     };
     let home = home_dir();
     match cli.cmd {
-        Cmd::Serve { zellij, rules } => match cmd_serve(&home, zellij, rules) {
+        Cmd::Serve {
+            zellij,
+            rules,
+            client,
+        } => match cmd_serve(&home, zellij, rules, &client) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("mai-probe serve: {e}");
                 ExitCode::FAILURE
             }
         },
+        Cmd::Stop { client } => cmd_stop(&home, &client),
         Cmd::Hook { agent } => {
             cmd_hook(&home, &agent);
             ExitCode::SUCCESS

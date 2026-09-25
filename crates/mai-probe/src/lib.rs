@@ -2,6 +2,7 @@
 
 pub mod hookmap;
 pub mod install;
+pub mod instance;
 pub mod metrics;
 pub mod rules;
 pub mod run;

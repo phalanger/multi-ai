@@ -219,7 +219,7 @@ fn write_doc(path: &Path, doc: &Value, now_ms: u64) -> Result<(), InstallError> 
         fs::create_dir_all(dir).map_err(io_err)?;
     }
     let mut tmp = target.as_os_str().to_owned();
-    tmp.push(".mai-tmp");
+    tmp.push(format!(".mai-tmp-{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     let mut text = serde_json::to_string_pretty(doc).expect("Value serializes");
     text.push('\n');

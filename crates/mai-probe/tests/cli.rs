@@ -128,3 +128,121 @@ fn emit_outside_zellij_fails() {
     assert_eq!(out.status.code(), Some(1));
     assert!(spool_lines(home.path()).is_empty());
 }
+
+/// Start `serve` for `client` with stdin held open, so it keeps running.
+fn spawn_serve(home: &Path, client: &str) -> std::process::Child {
+    let missing = home.join("no-zellij");
+    Command::new(env!("CARGO_BIN_EXE_mai-probe"))
+        .args(["serve", "--client", client, "--zellij"])
+        .arg(&missing)
+        .env("MAI_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+/// Poll `f` every 50 ms for up to 10 s.
+fn wait_for(mut f: impl FnMut() -> bool) -> bool {
+    for _ in 0..200 {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+fn pid_in(file: &Path) -> Option<u32> {
+    std::fs::read_to_string(file).ok()?.trim().parse().ok()
+}
+
+#[test]
+fn new_serve_replaces_old_one_and_stop_ends_it() {
+    let home = tempfile::tempdir().unwrap();
+    let pids = home.path().join("serve-t1.pid");
+    let mut first = spawn_serve(home.path(), "t1");
+    assert!(wait_for(|| pid_in(&pids) == Some(first.id())));
+
+    let mut second = spawn_serve(home.path(), "t1");
+    assert!(
+        wait_for(|| first.try_wait().unwrap().is_some()),
+        "old serve must be stopped"
+    );
+    assert!(wait_for(|| pid_in(&pids) == Some(second.id())));
+
+    let out = probe(home.path(), &["stop", "--client", "t1"], "", false);
+    assert_eq!(out.status.code(), Some(0));
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reply["stopped"], second.id());
+    assert!(wait_for(|| second.try_wait().unwrap().is_some()));
+}
+
+#[test]
+fn serves_of_different_clients_coexist() {
+    let home = tempfile::tempdir().unwrap();
+    let mut a = spawn_serve(home.path(), "a");
+    assert!(wait_for(
+        || pid_in(&home.path().join("serve-a.pid")) == Some(a.id())
+    ));
+    let mut b = spawn_serve(home.path(), "b");
+    assert!(wait_for(
+        || pid_in(&home.path().join("serve-b.pid")) == Some(b.id())
+    ));
+    assert!(
+        a.try_wait().unwrap().is_none(),
+        "other client's serve keeps running"
+    );
+    drop(a.stdin.take());
+    drop(b.stdin.take());
+    assert!(wait_for(|| a.try_wait().unwrap().is_some()));
+    assert!(wait_for(|| b.try_wait().unwrap().is_some()));
+    assert!(
+        !home.path().join("serve-a.pid").exists(),
+        "pid file removed on exit"
+    );
+}
+
+#[test]
+fn stop_without_running_serve_reports_null() {
+    let home = tempfile::tempdir().unwrap();
+    let out = probe(home.path(), &["stop"], "", false);
+    assert_eq!(out.status.code(), Some(0));
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reply["stopped"], Value::Null);
+}
+
+#[test]
+fn deployed_probe_keeps_data_next_to_its_bin_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join(".mai").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = bin.join(if cfg!(windows) {
+        "mai-probe.exe"
+    } else {
+        "mai-probe"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_mai-probe"), &exe).unwrap();
+    let elsewhere = root.path().join("elsewhere");
+    let mut child = Command::new(&exe)
+        .args(["hook", "claude"])
+        .env("MAI_HOME", &elsewhere)
+        .env("ZELLIJ_SESSION_NAME", "work")
+        .env("ZELLIJ_PANE_ID", "5")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(STOP.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(spool_lines(&root.path().join(".mai")).len(), 1);
+    assert!(
+        !elsewhere.exists(),
+        "MAI_HOME is ignored for a deployed probe"
+    );
+}
