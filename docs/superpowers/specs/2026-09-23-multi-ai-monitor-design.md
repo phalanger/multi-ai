@@ -76,6 +76,10 @@ keyring, tokio, sha2, serde
 
 两条连接相互隔离：探针流量不影响交互延迟，任一条断开各自重连。
 
+本机不经 SSH：探针复制到 `<home>/.mai/bin/` 后作为子进程运行
+（Windows 上使用 `CREATE_NO_WINDOW`，不弹控制台窗口），经子进程的
+stdin/stdout 通信；本机不需要 sshd。
+
 ## 3. 连接与认证
 
 ### 3.1 主机配置
@@ -108,17 +112,33 @@ keyring, tokio, sha2, serde
 主机状态：`Connecting`、`Online`、`Degraded`（仅一条连接可用）、`Offline`、`AuthRequired`。
 每条连接断开后独立指数退避重连（1s 起，上限 60s）；`AuthRequired` 不自动重试，等待用户操作。
 
+- 每台主机由一个任务负责探针连接：连接、部署、启动 `serve`、转发消息、重连。
+  同一主机的连接与部署因此不会并发；另有按主机的锁，终端连接（03c）连接时
+  同样持有，避免同一主机同时弹出两次主机密钥确认。
+- 每条连接的状态：`Connecting`、`Up`、`Retrying`（附下次重试的等待时间与原因）、
+  `NeedsUser`（附原因）。主机状态由两条连接的状态推出；终端连接出现之前只看探针连接。
+- 需要用户处理、不自动重试的原因：认证失败、拒绝主机密钥、主机密钥变化、
+  部署失败（如缺少对应平台的探针、上传失败）、配置错误（如 ssh config 无法解析）、
+  探针协议版本不符。用户点“重试”后立即重连。
+- 网络类错误（TCP、密钥交换、认证过程中连接断开、通道错误）按退避自动重试。
+  探针连续在线超过 30 秒后断开，退避重新从 1 秒开始；刚启动就断开的探针继续加倍等待。
+- hook 安装失败不影响连接：探针照常运行（仅靠抓屏识别），失败原因交给 UI 显示。
+
 ## 4. 探针 mai-probe
 
 ### 4.1 子命令
 
 | 子命令 | 调用方 | 作用 |
 | --- | --- | --- |
-| `serve [--zellij <path>] [--rules <file>]` | 应用启动 | 随 channel 存活，经 stdio 通信 |
+| `serve [选项]` | 应用启动 | 随 channel 存活，经 stdio 通信 |
+| `stop [--client <id>]` | 应用部署前 | 结束该 client 正在运行的 `serve`（见 4.6） |
 | `hook <agent>` | Claude Code / Codex hooks | 事件名取自载荷，写 spool 即返回 |
 | `emit --agent <name> --state <s> [--msg <m>]` | cmagent 及其他 agent | 通用上报接口 |
 | `install-hooks` / `uninstall-hooks` | 应用在部署后调用 | 合并式修改 agent 配置 |
-| `--version` | 应用部署时 | 输出版本与构建哈希 |
+| `--version` | 手工检查 | 输出版本（部署靠 SHA-256 比较，不需要构建哈希） |
+
+`serve` 的选项：`--zellij <path>`（zellij 位置，见 4.5）、`--rules <file>`
+（抓屏规则，默认内置规则）、`--client <id>`（应用安装标识，见 4.3、4.6）。
 
 hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因此 `install-hooks`
 要求探针从 `.mai/bin` 下的绝对路径运行；否则每个 agent 输出 `outcome` 为 `error`
@@ -131,23 +151,37 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 2. 以远程命令计算 `<home>/.mai/bin/mai-probe` 的 SHA-256
    （`sha256sum`、`shasum -a 256`、`certutil`、`Get-FileHash`），
    与应用内置二进制比较；一致则跳过上传。
-3. 不一致或不存在：SFTP 上传到 `<exe>.upload`；非 Windows 上 chmod 0755；
+3. 不一致或不存在：若旧文件存在，先执行旧探针的 `stop --client <id>`（尽力而为，
+   旧版本没有该子命令时忽略）；SFTP 上传到 `<exe>.upload`；非 Windows 上 chmod 0755；
    若目标文件已存在则先删除，再将 `<exe>.upload` 重命名为目标名。
    SFTP 路径相对登录目录（`.mai/bin/...`）；内置二进制来自 CI 产物 `probes/<target>/`。
    上传后的校验、以及 SFTP 不可用时回退 exec 写入均尚未实现；
    “先删后 rename”之间还有一段窗口不是原子的，见
    `docs/superpowers/plans/2026-09-24-02-followups.md`（B18）。
 4. 执行 `mai-probe install-hooks`（幂等）。
-5. 执行 `mai-probe serve`。
+5. 执行 `mai-probe serve --client <id>`。`<id>` 是本应用安装的标识，只保留
+   `[A-Za-z0-9_-]`；为空时不传该参数（PowerShell 5.1 会丢弃空参数）。
+   远程命令经 SSH env 请求设置 `LANG`、`LC_CTYPE` 为 `en_US.UTF-8`。
+
+本机按同样的步骤处理，只是改为本地文件复制与子进程（见 2.2）。
 
 ### 4.3 spool 目录
 
-- 位置：`<home>/.mai/spool/`，每个事件一个 JSON 行，按天分文件，追加写入。
+- 位置：`<数据目录>/spool/`，每个事件一个 JSON 行，按天分文件，追加写入。
   文件名为自 epoch 起的 UTC 天数 `<day>.jsonl`；游标为 `(day << 40) | 行尾偏移`，
-  跨文件严格递增。数据目录可由 `MAI_HOME` 覆盖。
+  跨文件严格递增。
+- 数据目录：探针位于 `<dir>/bin/` 且 `<dir>` 的名字以 `.mai` 开头（部署目录，
+  如 `~/.mai`）时就是 `<dir>`；否则为 `MAI_HOME`，再否则为 `<home>/.mai`。
+  hook 与 `serve` 运行的是同一个已部署的二进制，因此即使两者的环境变量不同，
+  也总是读写同一个目录。
 - hook 子命令只追加写，不做网络与重计算，保证不拖慢 agent。
 - `serve` 启动时从上次确认的偏移量重放，运行中持续 tail。
-- 应用确认收到后，`serve` 更新偏移量文件；超过 7 天的 spool 文件自动清理。
+- 应用把 hook 事件交给监控任务后立即回 `Ack`；`serve` 把偏移量写入
+  `ack-<client>`（没有 client 时为 `ack`），不同应用各自一份，互不影响。
+  写入经以进程号命名的临时文件再重命名。
+- UTC 零点后 10 秒内不读新一天的文件：hook 在零点前取的时间戳可能在零点后
+  才写入前一天的文件，读取方一旦进入新的一天就不再回看旧文件。
+- `serve` 每小时检查一次，删除超过 7 天的 spool 文件（启动后的第一次检查立即执行）。
 
 ### 4.4 hook 安装（合并式修改）
 
@@ -167,14 +201,34 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
   （`/opt/homebrew/bin`、`/usr/local/bin`、`~/.cargo/bin`、`~/.local/bin`）、
   登录 shell（`$SHELL -lc 'command -v zellij'`）。
   非交互 SSH exec 的 PATH 常不含这些位置（spike 在 macOS 上证实）。
+- 显式给出的 `--zellij` 路径不存在时，直接按“找不到”处理，不再回退到 PATH、
+  常见位置或登录 shell。
 - 找不到：`Hello` 中报告 `zellij: null`，应用提示用户“将 zellij 加入 PATH 或在主机设置中填写路径”，
   该主机的监控停在此步，不做猜测。
+- 每条 zellij 命令最多运行 5 秒，超时即结束该进程并报错，不会卡住 `serve` 循环。
+  Windows 上以 `CREATE_NO_WINDOW` 启动。
+- 周期性操作（列 session、列 pane、抓屏、清理 spool）的错误按操作对象只在
+  开始失败时报告一次，恢复成功后再次失败才会再报告。
+
+### 4.6 单实例
+
+- 半开的 SSH 连接可能留下旧的 `serve`；在 Windows 上它还锁住探针文件，导致无法重新部署。
+- 每个 `serve` 把自己的进程号写入 `<数据目录>/serve-<client>.pid`。新的 `serve`
+  启动时（以及 `mai-probe stop`）结束该文件记录的进程：只在该进程仍存活且名字以
+  `mai-probe` 开头时才结束，最多等 3 秒。不同 client 的 `serve` 可以同时运行。
+- `serve` 正常退出时，若 pid 文件仍是自己的进程号则删除它；被强制结束时残留的
+  pid 文件无害。
+- 另一个 client 的 `serve` 仍在运行时，Windows 上替换探针会失败，部署报错并等待用户处理。
 
 ## 5. 通信协议 mai-protocol
 
 - 传输：探针 stdout 输出、应用写入探针 stdin，均为每行一个 JSON 对象（JSON Lines）。
 - 每条消息含 `type` 字段；协议版本 `PROTOCOL_VERSION: u32`。
-- 握手：探针首先发送 `Hello`；应用比对协议版本，不兼容则终止并重新部署。
+- 握手：探针首先发送 `Hello`；应用比对协议版本，不兼容则等待用户处理
+  （部署已按 SHA-256 保证探针与应用内置的一致，版本仍不符说明安装包有误）。
+- `Hello` 之前最多容忍 50 行非协议输出（如 shell 启动文件打印的内容）；
+  30 秒内没有 `Hello`，或之后 20 秒没有任何消息（心跳每 5 秒一次），应用断开并重连。
+- 无法解析的行转为 `code` 为 `bad_probe_line` 的 `Error`，不中断连接。
 
 ### 5.1 探针到应用
 
@@ -237,6 +291,14 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
    - 屏幕内容匹配 agent 特征规则。
 
    普通 shell pane 不在 UI 列表中显示。
+
+4. **绑定的保持与解除**：
+   - 仅由抓屏识别的 agent，只要它自己的任一规则（标题或命令、屏幕特征、
+     needs-input、done）仍匹配就保持绑定；连续 2 次抓屏都不匹配才报告 `Exited`。
+     这样 Claude 在弹窗（计划确认、AskUserQuestion 等）下不会被误判退出。
+   - hook 报告 `Exited` 后，该 pane 至少要出现一次“什么 agent 都识别不到”的抓屏，
+     才允许抓屏重新绑定；否则残留的标题或最后一屏会让它被重新识别，
+     随后产生一次虚假的 `Done` 提醒。
 
 ### 6.3 合并规则
 
