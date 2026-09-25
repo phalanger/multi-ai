@@ -59,15 +59,19 @@ keyring, tokio, sha2, serde
 
 应用安装包内置全部探针二进制，部署无需联网。
 
-### 2.2 Transport 抽象
+### 2.2 连接抽象
 
-`mai-core` 定义 `Transport` trait，统一远程与本机：
+`mai-core` 用 `host::Connector` trait 统一远程与本机，分两部分：
 
 | 能力 | 远程实现（russh） | 本机实现 |
 | --- | --- | --- |
-| 执行命令（exec，取 stdin/stdout） | SSH exec channel | 子进程 |
-| 打开 PTY 运行命令 | SSH PTY channel | portable-pty（Windows 为 ConPTY） |
-| 上传文件 | SFTP，失败回退 exec 写文件 | 本地文件复制 |
+| `open`：部署探针并启动 `serve` | SSH exec channel | 子进程 |
+| `open_terminals`：终端连接 | 独立的 SSH 会话 | 无（直接用本机 PTY） |
+| 终端连接上的 `attach` | SSH PTY channel | portable-pty（Windows 为 ConPTY） |
+| 上传探针 | SFTP | 本地文件复制 |
+
+`attach` 的结果统一为一对通道（输入：数据、尺寸、关闭；输出：数据、退出状态），
+输出在没有退出状态的情况下结束即表示连接断开。测试用内存中的假实现代替。
 
 每台远程主机建立两条独立 SSH 连接：
 
@@ -116,7 +120,8 @@ stdin/stdout 通信；本机不需要 sshd。
   同一主机的连接与部署因此不会并发；另有按主机的锁，终端连接（03c）连接时
   同样持有，避免同一主机同时弹出两次主机密钥确认。
 - 每条连接的状态：`Connecting`、`Up`、`Retrying`（附下次重试的等待时间与原因）、
-  `NeedsUser`（附原因）。主机状态由两条连接的状态推出；终端连接出现之前只看探针连接。
+  `NeedsUser`（附原因）。主机状态由两条连接的状态推出；没有打开的终端时
+  只看探针连接（终端连接此时不存在），有终端时只有一条可用即为 `Degraded`。
 - 需要用户处理、不自动重试的原因：认证失败、拒绝主机密钥、主机密钥变化、
   部署失败（如缺少对应平台的探针、上传失败）、配置错误（如 ssh config 无法解析）、
   探针协议版本不符。用户点“重试”后立即重连。
@@ -318,14 +323,29 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 ## 7. 交互终端
 
 - 每个已打开的 `(host, session)` 对应 UI 中一个终端标签，内容为 xterm.js。
-- 远程：TermConn 上开 PTY channel，`TERM=xterm-256color`，执行 `<zellij> attach <session>`。
-- 远程命令必须使用 UTF-8 locale：优先经 SSH env 请求发送 `LANG`/`LC_CTYPE`，
-  服务器拒绝时在命令前加 `LANG=... LC_CTYPE=...`。否则 macOS 上中文输入异常。
+- 远程：TermConn 上开 PTY channel，`TERM=xterm-256color`，执行
+  `<zellij> attach [--create] <session>`。zellij 路径依次取主机配置、
+  探针 `Hello` 报告的路径，都没有时用 PATH 中的 `zellij`。
+- 远程命令必须使用 UTF-8 locale：经 SSH env 请求发送 `LANG`/`LC_CTYPE`
+  并等待服务器答复（最多 10 秒）；服务器拒绝时，POSIX shell 的命令前加
+  `LANG=... LC_CTYPE=...`。否则 macOS 上中文输入异常。
 - xterm.js 必须加载 `@xterm/addon-clipboard`（zellij 复制走 OSC 52）与
   `@xterm/addon-unicode11`（宽字符宽度与 zellij 一致）。
-- 本机：portable-pty 执行同样命令。
+- 本机：portable-pty 执行同样命令，环境加 `TERM=xterm-256color`，非 Windows
+  再加 UTF-8 locale（GUI 应用的环境里可能没有）。ConPTY 启动时发出光标位置查询
+  （`ESC[6n`）并等待答复，由 xterm.js 应答；应用不代为应答，以免答复两次。
 - 窗口尺寸变化同步到 PTY（window-change）。
 - 字节流：PTY 输出经 Tauri event 推给前端，前端键盘输入经 Tauri command 写回 PTY。
+- 每台主机一个终端任务：第一个终端打开时建立 TermConn（持有与探针连接相同的
+  按主机的锁，避免同时弹两次主机密钥确认），最后一个关闭时断开。
+- 终端事件：`Attached`（已连接，zellij 会重绘整屏）、`Output`、
+  `Detached`（连接断开）、`Exited`（`zellij attach` 退出：用户 detach 或退出
+  session，终端结束）。
+- TermConn 断开：所有终端收到 `Detached`，按退避重连后以当前尺寸重新 attach，
+  再收到 `Attached`。需要用户处理的问题（认证、主机密钥）等待“重试”。
+- 关闭终端即关闭该 PTY（zellij 客户端 detach，session 保留）。
+- 新建的 zellij session 可能先显示“Tips”弹窗，按 ESC 关闭；这是 zellij 的行为，
+  UI 不做特殊处理。
 
 ## 8. 点击跳转
 
@@ -385,6 +405,8 @@ attach 同一 session 并有输入，跳转会作用到那个终端。
 - 所有错误带上下文（主机、连接、步骤），在 UI 对应主机上显示，不静默吞掉。
 - 探针部署、hook 安装失败时，该主机降级为仅终端可用，并显示原因与重试入口。
 - 探针退出或 channel 断开：由 ProbeConn 重连后重新部署检查、重启 `serve`，spool 保证事件不丢。
+- 探针的 stderr 保留最后 2 KB；探针停止时，把最后几行非空内容附在重试原因后面
+  （如规则文件错误），而不是只显示“probe stream closed”。
 - 配置文件解析失败：拒绝启动对应功能并指出文件与行号，不使用默认值覆盖用户文件。
 
 ## 12. 测试策略
