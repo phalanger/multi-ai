@@ -1,6 +1,8 @@
 //! Install mai-probe on a remote host (design 4.2): detect OS, CPU and
 //! login shell, compare SHA-256 with the bundled binary, upload over SFTP
-//! when different, then run `install-hooks`.
+//! when different, then run `install-hooks`. When an existing probe
+//! differs, `mai-probe stop --client <id>` is run first (best effort) so
+//! a running probe does not lock the file.
 
 use std::fmt;
 use std::path::PathBuf;
