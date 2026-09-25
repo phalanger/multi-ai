@@ -3,8 +3,11 @@
 
 use std::ffi::OsStr;
 use std::fmt;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use mai_protocol::{PaneInfo, SessionInfo};
 use serde::Deserialize;
@@ -156,13 +159,74 @@ pub fn find_zellij_in(
 
 /// Last resort on Unix: ask the user's login shell.
 pub fn find_via_login_shell(shell: &OsStr) -> Option<PathBuf> {
-    let out = Command::new(shell)
-        .args(["-lc", "command -v zellij"])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(shell);
+    cmd.args(["-lc", "command -v zellij"]);
+    let out = output_with_timeout(&mut cmd, COMMAND_TIMEOUT).ok()??;
     let path = String::from_utf8(out.stdout).ok()?;
     let path = PathBuf::from(path.trim());
     (out.status.success() && path.is_file()).then_some(path)
+}
+
+/// How long one zellij command may run before it is killed. A hung
+/// `zellij action` must not stall the whole serve loop.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Windows `CREATE_NO_WINDOW`: a probe started without a console must not
+/// open a console window for every command it runs.
+#[cfg(windows)]
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000)
+}
+
+#[cfg(not(windows))]
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    cmd
+}
+
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+fn wait_until(child: &mut Child, deadline: Instant) -> io::Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Run `cmd` to completion and collect its output, or kill it after
+/// `timeout` and return `Ok(None)`. Pipes are drained on threads so a
+/// chatty child cannot block on a full pipe.
+pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<Option<Output>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let out = drain(child.stdout.take());
+    let err = drain(child.stderr.take());
+    let Some(status) = wait_until(&mut child, Instant::now() + timeout)? else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
+    };
+    Ok(Some(Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    }))
 }
 
 /// `Zellij` backed by the real CLI.
@@ -181,10 +245,16 @@ impl CliZellij {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        Command::new(&self.exe)
-            .args(args)
-            .output()
-            .map_err(|e| ZellijError(format!("spawn {}: {e}", self.exe.display())))
+        let mut cmd = Command::new(&self.exe);
+        cmd.args(args);
+        match output_with_timeout(no_window(&mut cmd), COMMAND_TIMEOUT) {
+            Ok(Some(out)) => Ok(out),
+            Ok(None) => Err(ZellijError(format!(
+                "zellij timed out after {}s",
+                COMMAND_TIMEOUT.as_secs()
+            ))),
+            Err(e) => Err(ZellijError(format!("spawn {}: {e}", self.exe.display()))),
+        }
     }
 
     fn run<I, S>(&self, args: I) -> Result<String, ZellijError>

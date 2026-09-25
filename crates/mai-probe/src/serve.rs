@@ -2,7 +2,7 @@
 //! `ProbeMsg`s, and applies `AppMsg`s. Apart from the `Zellij` trait and
 //! the spool directory it does no IO, so tests drive it with a fake zellij.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Display;
 
 use mai_protocol::{
@@ -17,6 +17,16 @@ use crate::zellij::Zellij;
 
 /// Shortest interval `AppMsg::SetInterval` may set (one run-loop tick).
 pub const MIN_INTERVAL_MS: u64 = 250;
+
+/// Spool day files older than this many days are deleted.
+pub const SPOOL_KEEP_DAYS: u64 = 7;
+
+/// How often a long-running serve deletes old spool files.
+pub const CLEANUP_EVERY_MS: u64 = 3_600_000;
+
+/// A scrape-identified agent is reported `Exited` only after this many
+/// consecutive scrapes in which none of its rules match the pane.
+pub const MISSES_TO_EXIT: u8 = 2;
 
 /// Polling intervals; changed by `AppMsg::SetInterval`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +64,26 @@ pub(crate) fn due(last: Option<u64>, every_ms: u64, now_ms: u64) -> bool {
 struct Binding {
     agent: String,
     from_hook: bool,
+    /// Consecutive scrapes in which none of the agent's rules matched.
+    misses: u8,
+}
+
+/// What a periodic operation was doing when it failed. A failure is
+/// reported once, when it starts; the scope must succeed again before a
+/// new failure is reported.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Scope {
+    Sessions,
+    Panes(String),
+    Dump(PaneRef),
+    Cleanup,
+}
+
+/// Push `msg` unless `scope` is already failing.
+fn report(failing: &mut HashSet<Scope>, scope: Scope, msg: ProbeMsg, out: &mut Vec<ProbeMsg>) {
+    if failing.insert(scope) {
+        out.push(msg);
+    }
 }
 
 pub struct Server<Z> {
@@ -65,10 +95,16 @@ pub struct Server<Z> {
     read_cursor: u64,
     last_pane_poll: Option<u64>,
     last_scrape: Option<u64>,
+    last_cleanup: Option<u64>,
     sessions: Vec<SessionInfo>,
     panes: BTreeMap<String, Vec<PaneInfo>>,
     /// Panes known to run an agent (from hooks or identification).
     agents: HashMap<PaneRef, Binding>,
+    /// Panes whose agent a hook reported `Exited`. Scraping may bind them
+    /// again only after one scrape in which no agent is identified, so a
+    /// leftover title or last screen does not bring the agent back.
+    exit_hold: HashSet<PaneRef>,
+    failing: HashSet<Scope>,
     spool_failing: bool,
 }
 
@@ -85,9 +121,12 @@ impl<Z: Zellij> Server<Z> {
             intervals: Intervals::default(),
             last_pane_poll: None,
             last_scrape: None,
+            last_cleanup: None,
             sessions: Vec::new(),
             panes: BTreeMap::new(),
             agents: HashMap::new(),
+            exit_hold: HashSet::new(),
+            failing: HashSet::new(),
             spool_failing: false,
         })
     }
@@ -96,11 +135,26 @@ impl<Z: Zellij> Server<Z> {
         self.intervals
     }
 
-    /// One scheduling step: new spool records, then pane polling and
-    /// screen scraping when their intervals are due.
+    /// One scheduling step: old spool files are deleted when due, then
+    /// new spool records are read, then panes are polled and screens
+    /// scraped when their intervals are due.
     pub fn tick(&mut self, now_ms: u64) -> Vec<ProbeMsg> {
         let mut out = Vec::new();
-        self.drain_spool(&mut out);
+        if due(self.last_cleanup, CLEANUP_EVERY_MS, now_ms) {
+            self.last_cleanup = Some(now_ms);
+            match self.spool.cleanup(now_ms, SPOOL_KEEP_DAYS) {
+                Ok(_) => {
+                    self.failing.remove(&Scope::Cleanup);
+                }
+                Err(e) => report(
+                    &mut self.failing,
+                    Scope::Cleanup,
+                    error("spool_cleanup", e),
+                    &mut out,
+                ),
+            }
+        }
+        self.drain_spool(now_ms, &mut out);
         if self.zellij.is_some() {
             if due(self.last_pane_poll, self.intervals.pane_poll_ms, now_ms) {
                 self.last_pane_poll = Some(now_ms);
@@ -114,8 +168,8 @@ impl<Z: Zellij> Server<Z> {
         out
     }
 
-    fn drain_spool(&mut self, out: &mut Vec<ProbeMsg>) {
-        let read = match self.spool.read_after(self.read_cursor) {
+    fn drain_spool(&mut self, now_ms: u64, out: &mut Vec<ProbeMsg>) {
+        let read = match self.spool.read_after(self.read_cursor, now_ms) {
             Ok(r) => r,
             Err(e) => {
                 if !self.spool_failing {
@@ -146,12 +200,15 @@ impl<Z: Zellij> Server<Z> {
                 {
                     self.agents.remove(&pane);
                     self.scrape.forget(&pane);
+                    self.exit_hold.insert(pane.clone());
                 } else {
                     let binding = Binding {
                         agent: rec.agent.clone(),
                         from_hook: true,
+                        misses: 0,
                     };
                     self.agents.insert(pane.clone(), binding);
+                    self.exit_hold.remove(&pane);
                 }
             }
             if let Some(m) = mapped {
@@ -171,8 +228,13 @@ impl<Z: Zellij> Server<Z> {
     fn poll_panes(&mut self, out: &mut Vec<ProbeMsg>) {
         let Some(z) = &self.zellij else { return };
         let sessions = match z.sessions() {
-            Ok(s) => s,
-            Err(e) => return out.push(error("zellij", e)),
+            Ok(s) => {
+                self.failing.remove(&Scope::Sessions);
+                s
+            }
+            Err(e) => {
+                return report(&mut self.failing, Scope::Sessions, error("zellij", e), out);
+            }
         };
         if sessions != self.sessions {
             out.push(ProbeMsg::Sessions {
@@ -182,8 +244,10 @@ impl<Z: Zellij> Server<Z> {
         }
         let mut fresh = BTreeMap::new();
         for s in self.sessions.iter().filter(|s| !s.exited) {
+            let scope = Scope::Panes(s.name.clone());
             match z.panes(&s.name) {
                 Ok(panes) => {
+                    self.failing.remove(&scope);
                     if self.panes.get(&s.name) != Some(&panes) {
                         out.push(ProbeMsg::Panes {
                             session: s.name.clone(),
@@ -193,31 +257,36 @@ impl<Z: Zellij> Server<Z> {
                     fresh.insert(s.name.clone(), panes);
                 }
                 Err(e) => {
-                    out.push(error("zellij", e));
+                    report(&mut self.failing, scope, error("zellij", e), out);
                     if let Some(old) = self.panes.get(&s.name) {
                         fresh.insert(s.name.clone(), old.clone());
                     }
                 }
             }
         }
+        let exists = |p: &PaneRef| {
+            fresh
+                .get(&p.session)
+                .is_some_and(|ps: &Vec<PaneInfo>| ps.iter().any(|q| q.id == p.pane_id))
+        };
         for (session, panes) in &self.panes {
             for p in panes {
-                let still = fresh
-                    .get(session)
-                    .is_some_and(|ps| ps.iter().any(|q| q.id == p.id));
-                if !still {
-                    let gone = PaneRef {
-                        session: session.clone(),
-                        pane_id: p.id,
-                    };
-                    self.scrape.forget(&gone);
+                let pane = PaneRef {
+                    session: session.clone(),
+                    pane_id: p.id,
+                };
+                if !exists(&pane) {
+                    self.scrape.forget(&pane);
                 }
             }
         }
-        self.agents.retain(|k, _| {
-            fresh
-                .get(&k.session)
-                .is_some_and(|ps| ps.iter().any(|p| p.id == k.pane_id))
+        self.agents.retain(|k, _| exists(k));
+        self.exit_hold.retain(|k| exists(k));
+        let live = &self.sessions;
+        self.failing.retain(|s| match s {
+            Scope::Panes(name) => live.iter().any(|l| !l.exited && &l.name == name),
+            Scope::Dump(p) => exists(p),
+            Scope::Sessions | Scope::Cleanup => true,
         });
         self.panes = fresh;
     }
@@ -229,6 +298,8 @@ impl<Z: Zellij> Server<Z> {
             scrape,
             agents,
             panes,
+            exit_hold,
+            failing,
             ..
         } = self;
         let Some(z) = zellij else { return };
@@ -238,29 +309,52 @@ impl<Z: Zellij> Server<Z> {
                     session: session.clone(),
                     pane_id: p.id,
                 };
+                let scope = Scope::Dump(pane.clone());
                 let screen = match z.dump_screen(session, p.id) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        failing.remove(&scope);
+                        s
+                    }
                     Err(e) => {
-                        out.push(error("zellij", e));
+                        report(failing, scope, error("zellij", e), out);
                         continue;
                     }
                 };
-                let found = rules.identify(&p.title, p.command.as_deref(), &screen);
-                let agent = match agents.get(&pane) {
-                    Some(b) if b.from_hook || found == Some(b.agent.as_str()) => b.agent.clone(),
+                let command = p.command.as_deref();
+                let found = rules.identify(&p.title, command, &screen);
+                let agent = match agents.get_mut(&pane) {
+                    Some(b) if b.from_hook => b.agent.clone(),
                     Some(b) => {
-                        // Agent is gone from a scrape-identified pane (e.g.
-                        // back at the shell): report it once and unbind.
-                        out.push(scrape_event(&pane, &b.agent, AgentState::Exited, now_ms));
-                        agents.remove(&pane);
-                        scrape.forget(&pane);
-                        continue;
+                        if found == Some(b.agent.as_str())
+                            || rules.still_matches(&b.agent, &p.title, command, &screen)
+                        {
+                            b.misses = 0;
+                            b.agent.clone()
+                        } else {
+                            b.misses += 1;
+                            if b.misses < MISSES_TO_EXIT {
+                                continue;
+                            }
+                            // Agent is gone from a scrape-identified pane
+                            // (e.g. back at the shell): report it once.
+                            out.push(scrape_event(&pane, &b.agent, AgentState::Exited, now_ms));
+                            agents.remove(&pane);
+                            scrape.forget(&pane);
+                            continue;
+                        }
                     }
                     None => {
-                        let Some(a) = found else { continue };
+                        let Some(a) = found else {
+                            exit_hold.remove(&pane);
+                            continue;
+                        };
+                        if exit_hold.contains(&pane) {
+                            continue;
+                        }
                         let binding = Binding {
                             agent: a.to_owned(),
                             from_hook: false,
+                            misses: 0,
                         };
                         agents.insert(pane.clone(), binding);
                         out.push(scrape_event(&pane, a, AgentState::Unknown, now_ms));

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mai_probe::rules::default_rules;
-use mai_probe::serve::{Intervals, Server};
+use mai_probe::serve::{CLEANUP_EVERY_MS, Intervals, Server};
 use mai_probe::spool::{Spool, SpoolRecord};
 use mai_probe::zellij::{Zellij, ZellijError};
 use mai_protocol::{
@@ -317,12 +317,120 @@ fn scraped_agent_leaving_pane_is_reported_exited_once() {
         );
         st.screens.insert(4, "C:\\>".into());
     }
-    let ev: Vec<(u32, AgentState, EventSource)> = events(&s.tick(3_000))
+    assert!(
+        events(&s.tick(3_000)).is_empty(),
+        "one miss is not enough to report Exited"
+    );
+    let ev: Vec<(u32, AgentState, EventSource)> = events(&s.tick(6_000))
         .iter()
         .map(|e| (e.pane.pane_id, e.state, e.source))
         .collect();
     assert_eq!(ev, vec![(4, AgentState::Exited, EventSource::Scrape)]);
+    assert!(events(&s.tick(9_000)).is_empty());
+}
+
+#[test]
+fn prompt_matching_only_needs_input_rules_keeps_scrape_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::default();
+    {
+        let mut st = fake.0.borrow_mut();
+        st.sessions = vec![session("work")];
+        st.panes.insert(
+            "work".into(),
+            vec![pane(4, "C:\\WINDOWS\\system32\\cmd.exe")],
+        );
+        st.screens.insert(4, fixture("claude-idle"));
+    }
+    let mut s = server(&fake, dir.path());
+    let ev: Vec<AgentState> = events(&s.tick(0)).iter().map(|e| e.state).collect();
+    assert_eq!(ev, vec![AgentState::Unknown]);
+    // A permission prompt that none of claude's screen patterns match.
+    fake.0
+        .borrow_mut()
+        .screens
+        .insert(4, " Do you want to proceed?\n > 1. Yes\n".into());
+    let mut seen = Vec::new();
+    for t in [3_000, 6_000, 9_000, 12_000] {
+        seen.extend(events(&s.tick(t)).iter().map(|e| e.state));
+    }
+    assert_eq!(seen, vec![AgentState::Working, AgentState::NeedsInput]);
+}
+
+#[test]
+fn hook_exit_blocks_scrape_rebinding_until_agent_leaves_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::new(dir.path());
+    spool.append(&stop_record(1, 5)).unwrap();
+    spool
+        .append(&SpoolRecord {
+            payload: json!({"hook_event_name": "SessionEnd"}),
+            ..stop_record(2, 5)
+        })
+        .unwrap();
+    let fake = Fake::default();
+    {
+        let mut st = fake.0.borrow_mut();
+        st.sessions = vec![session("work")];
+        st.panes.insert(
+            "work".into(),
+            vec![pane(5, "C:\\WINDOWS\\system32\\cmd.exe")],
+        );
+        // The agent's last screen is still visible after it exited.
+        st.screens.insert(5, fixture("claude-idle"));
+    }
+    let mut s = server(&fake, dir.path());
+    let ev: Vec<AgentState> = events(&s.tick(0)).iter().map(|e| e.state).collect();
+    assert_eq!(ev, vec![AgentState::Done, AgentState::Exited]);
+    assert!(
+        events(&s.tick(3_000)).is_empty(),
+        "leftover screen must not rebind"
+    );
+
+    fake.0.borrow_mut().screens.insert(5, "C:\\>".into());
     assert!(events(&s.tick(6_000)).is_empty());
+    fake.0
+        .borrow_mut()
+        .screens
+        .insert(5, fixture("claude-idle"));
+    let ev: Vec<(AgentState, EventSource)> = events(&s.tick(9_000))
+        .iter()
+        .map(|e| (e.state, e.source))
+        .collect();
+    assert_eq!(ev, vec![(AgentState::Unknown, EventSource::Scrape)]);
+}
+
+#[test]
+fn persistent_zellij_error_is_reported_once_per_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::default();
+    fake.0.borrow_mut().sessions = vec![session("work")];
+    fake.0.borrow_mut().fail_panes = true;
+    let mut s = server(&fake, dir.path());
+    assert_eq!(error_codes(&s.tick(0)), vec!["zellij"]);
+    assert!(error_codes(&s.tick(2_000)).is_empty());
+    fake.0.borrow_mut().fail_panes = false;
+    assert!(error_codes(&s.tick(4_000)).is_empty());
+    fake.0.borrow_mut().fail_panes = true;
+    assert_eq!(error_codes(&s.tick(6_000)), vec!["zellij"]);
+}
+
+#[test]
+fn old_spool_files_are_cleaned_up_periodically() {
+    const DAY: u64 = 86_400_000;
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::new(dir.path());
+    spool.append(&stop_record(DAY, 1)).unwrap();
+    let mut s = server(&Fake::default(), dir.path());
+    let now = 10 * DAY + 20_000;
+    s.tick(now);
+    assert!(!dir.path().join("1.jsonl").exists());
+
+    spool.append(&stop_record(2 * DAY, 2)).unwrap();
+    s.tick(now + 1_000);
+    assert!(dir.path().join("2.jsonl").exists(), "not due yet");
+    s.tick(now + CLEANUP_EVERY_MS);
+    assert!(!dir.path().join("2.jsonl").exists());
 }
 
 #[test]

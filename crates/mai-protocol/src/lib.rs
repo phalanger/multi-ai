@@ -15,3 +15,12 @@ pub use types::{
 
 /// Bumped on any incompatible change to message shapes.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// App installation id as passed to `mai-probe serve --client`: only
+/// `[A-Za-z0-9_-]` is kept, so the id is safe in file names and needs no
+/// shell quoting.
+pub fn sanitize_client(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}

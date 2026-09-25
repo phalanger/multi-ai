@@ -121,6 +121,29 @@ impl CompiledRules {
         })
     }
 
+    /// True when any of `agent`'s own rules still matches the pane: its
+    /// title patterns (title or command), screen patterns, or its
+    /// needs-input / done patterns. Prompts such as a plan confirmation
+    /// may match none of the screen patterns yet still show the agent.
+    pub fn still_matches(
+        &self,
+        agent: &str,
+        title: &str,
+        command: Option<&str>,
+        screen: &str,
+    ) -> bool {
+        let Some(r) = self.rule(agent) else {
+            return false;
+        };
+        if any_match(&r.title, title) || command.is_some_and(|c| any_match(&r.title, c)) {
+            return true;
+        }
+        let screen = r.clean(screen);
+        any_match(&r.screen, &screen)
+            || any_match(&r.needs_input, &screen)
+            || any_match(&r.done, &screen)
+    }
+
     fn rule(&self, name: &str) -> Option<&CompiledRule> {
         self.rules.iter().find(|r| r.name == name)
     }

@@ -5,6 +5,12 @@
 //! epoch (UTC). A record's cursor is `(day << 40) | end_offset`, where
 //! `end_offset` is the byte offset just past the record's newline, so
 //! cursors increase strictly across all files.
+//!
+//! A hook stamps its record just before appending it, so a record stamped
+//! at 23:59:59.999 can land in yesterday's file just after midnight. The
+//! reader therefore leaves a new day's file alone for `DAY_GRACE_MS`
+//! after that day starts; once it moves on to a day, earlier files are
+//! never read again.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -12,10 +18,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-const DAY_MS: u64 = 86_400_000;
+pub const DAY_MS: u64 = 86_400_000;
+/// How long after midnight (UTC) a new day's file is left unread.
+pub const DAY_GRACE_MS: u64 = 10_000;
 const OFFSET_BITS: u32 = 40;
 const OFFSET_MASK: u64 = (1 << OFFSET_BITS) - 1;
-const ACK_FILE: &str = "ack";
 
 /// One hook invocation as written by `mai-probe hook` / `emit`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,11 +53,33 @@ fn split_cursor(cursor: u64) -> (u64, u64) {
 
 pub struct Spool {
     dir: PathBuf,
+    /// Name of the file holding the acknowledged cursor.
+    ack_file: String,
 }
 
+pub use mai_protocol::sanitize_client;
+
 impl Spool {
+    /// Spool whose acknowledged cursor is stored in `ack`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            ack_file: "ack".to_owned(),
+        }
+    }
+
+    /// Spool whose acknowledged cursor belongs to one app installation
+    /// (`ack-<client>`), so two apps watching the same host do not
+    /// consume each other's events on restart.
+    pub fn for_client(dir: impl Into<PathBuf>, client: &str) -> Self {
+        let client = sanitize_client(client);
+        if client.is_empty() {
+            return Self::new(dir);
+        }
+        Self {
+            dir: dir.into(),
+            ack_file: format!("ack-{client}"),
+        }
     }
 
     fn day_file(&self, day: u64) -> PathBuf {
@@ -91,14 +120,18 @@ impl Spool {
 
     /// All complete records whose cursor is greater than `cursor`.
     /// A trailing line without a newline (still being written) is left
-    /// for the next call.
-    pub fn read_after(&self, cursor: u64) -> io::Result<ReadResult> {
+    /// for the next call, and so is any day after the cursor's day that
+    /// began less than `DAY_GRACE_MS` before `now_ms`.
+    pub fn read_after(&self, cursor: u64, now_ms: u64) -> io::Result<ReadResult> {
         let (cur_day, cur_off) = split_cursor(cursor);
         let mut out = ReadResult {
             end_cursor: cursor,
             ..ReadResult::default()
         };
         for day in self.days()?.into_iter().filter(|d| *d >= cur_day) {
+            if day > cur_day && now_ms < (day * DAY_MS).saturating_add(DAY_GRACE_MS) {
+                break;
+            }
             let start = if day == cur_day { cur_off } else { 0 };
             let mut f = File::open(self.day_file(day))?;
             f.seek(SeekFrom::Start(start))?;
@@ -123,17 +156,21 @@ impl Spool {
 
     /// Last cursor acknowledged by the app; 0 when none.
     pub fn load_ack(&self) -> u64 {
-        fs::read_to_string(self.dir.join(ACK_FILE))
+        fs::read_to_string(self.dir.join(&self.ack_file))
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0)
     }
 
+    /// Write the cursor via a temp file named after this process, so two
+    /// serves never share a temp file.
     pub fn store_ack(&self, cursor: u64) -> io::Result<()> {
         fs::create_dir_all(&self.dir)?;
-        let tmp = self.dir.join("ack.tmp");
+        let tmp = self
+            .dir
+            .join(format!("{}.{}.tmp", self.ack_file, std::process::id()));
         fs::write(&tmp, cursor.to_string())?;
-        fs::rename(tmp, self.dir.join(ACK_FILE))
+        fs::rename(tmp, self.dir.join(&self.ack_file))
     }
 
     /// Delete day files older than `keep_days` before `now_ms`.

@@ -1,8 +1,11 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use mai_probe::zellij::{
-    default_dirs, find_zellij_in, parse_panes, parse_sessions, parse_version, sessions_from_output,
+    default_dirs, find_zellij_in, output_with_timeout, parse_panes, parse_sessions, parse_version,
+    sessions_from_output,
 };
 use mai_protocol::{PaneInfo, SessionInfo};
 
@@ -171,5 +174,45 @@ fn default_dirs_order_matches_design() {
             home.join(".cargo").join("bin"),
             home.join(".local").join("bin"),
         ]
+    );
+}
+
+fn shell(script: &str) -> Command {
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/C");
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c");
+        c
+    };
+    cmd.arg(script);
+    cmd
+}
+
+#[test]
+fn command_output_is_collected() {
+    let out = output_with_timeout(&mut shell("echo hi"), Duration::from_secs(10))
+        .unwrap()
+        .expect("finished in time");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+}
+
+#[test]
+fn hung_command_is_killed_at_timeout() {
+    let script = if cfg!(windows) {
+        "ping -n 30 127.0.0.1 >NUL"
+    } else {
+        "sleep 30"
+    };
+    let start = Instant::now();
+    let out = output_with_timeout(&mut shell(script), Duration::from_millis(300)).unwrap();
+    assert!(out.is_none());
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
     );
 }
