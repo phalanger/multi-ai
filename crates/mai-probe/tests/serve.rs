@@ -204,6 +204,18 @@ fn sessions_and_panes_are_sent_only_on_change() {
 }
 
 #[test]
+fn empty_session_list_is_reported_on_first_poll() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::default();
+    let mut s = server(&fake, dir.path());
+    let out = s.tick(0);
+    assert!(matches!(&out[0], ProbeMsg::Sessions { sessions } if sessions.is_empty()));
+
+    let out = s.tick(2_000);
+    assert!(!out.iter().any(|m| matches!(m, ProbeMsg::Sessions { .. })));
+}
+
+#[test]
 fn scrape_identifies_agent_then_infers_state() {
     let dir = tempfile::tempdir().unwrap();
     let fake = Fake::default();

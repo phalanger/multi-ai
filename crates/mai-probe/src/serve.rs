@@ -96,7 +96,9 @@ pub struct Server<Z> {
     last_pane_poll: Option<u64>,
     last_scrape: Option<u64>,
     last_cleanup: Option<u64>,
-    sessions: Vec<SessionInfo>,
+    /// `None` until the first successful poll, so a reconnect always gets
+    /// a fresh `Sessions` message even when the host has zero sessions.
+    sessions: Option<Vec<SessionInfo>>,
     panes: BTreeMap<String, Vec<PaneInfo>>,
     /// Panes known to run an agent (from hooks or identification).
     agents: HashMap<PaneRef, Binding>,
@@ -122,7 +124,7 @@ impl<Z: Zellij> Server<Z> {
             last_pane_poll: None,
             last_scrape: None,
             last_cleanup: None,
-            sessions: Vec::new(),
+            sessions: None,
             panes: BTreeMap::new(),
             agents: HashMap::new(),
             exit_hold: HashSet::new(),
@@ -236,14 +238,20 @@ impl<Z: Zellij> Server<Z> {
                 return report(&mut self.failing, Scope::Sessions, error("zellij", e), out);
             }
         };
-        if sessions != self.sessions {
+        if self.sessions.as_ref() != Some(&sessions) {
             out.push(ProbeMsg::Sessions {
                 sessions: sessions.clone(),
             });
-            self.sessions = sessions;
+            self.sessions = Some(sessions);
         }
         let mut fresh = BTreeMap::new();
-        for s in self.sessions.iter().filter(|s| !s.exited) {
+        for s in self
+            .sessions
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|s| !s.exited)
+        {
             let scope = Scope::Panes(s.name.clone());
             match z.panes(&s.name) {
                 Ok(panes) => {
@@ -282,7 +290,7 @@ impl<Z: Zellij> Server<Z> {
         }
         self.agents.retain(|k, _| exists(k));
         self.exit_hold.retain(|k| exists(k));
-        let live = &self.sessions;
+        let live = self.sessions.as_deref().unwrap_or(&[]);
         self.failing.retain(|s| match s {
             Scope::Panes(name) => live.iter().any(|l| !l.exited && &l.name == name),
             Scope::Dump(p) => exists(p),
