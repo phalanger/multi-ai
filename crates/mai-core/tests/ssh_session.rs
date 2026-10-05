@@ -841,5 +841,3 @@ async fn connects_through_a_jump_host() {
     let learned = std::fs::read_to_string(dir.path().join("known_hosts")).unwrap();
     assert_eq!(learned.lines().count(), 2, "{learned}");
 }
-
-use std::future::Future;
