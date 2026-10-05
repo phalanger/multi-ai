@@ -1,5 +1,9 @@
 //! Resolve a host alias or `[user@]host[:port]` into connection
 //! parameters, using OpenSSH config text (`~/.ssh/config`).
+//!
+//! `Match` blocks are not supported: the parser would attribute their
+//! directives to the preceding `Host`, so they are removed before parsing
+//! and reported by `config_warnings`.
 
 use std::fmt;
 use std::io::BufReader;
@@ -17,7 +21,8 @@ pub struct HostSpec {
     pub user: String,
     /// Tried in order; missing files are skipped at auth time.
     pub identity_files: Vec<PathBuf>,
-    /// Jump hosts, outermost first (`ProxyJump`).
+    /// Jump hosts, outermost first (`ProxyJump`). Their own `ProxyJump`
+    /// settings are not followed, so their `jumps` are always empty.
     pub jumps: Vec<HostSpec>,
 }
 
@@ -33,14 +38,57 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 const DEFAULT_PORT: u16 = 22;
-const MAX_JUMP_DEPTH: usize = 8;
 const DEFAULT_KEYS: &[&str] = &["id_ed25519", "id_ecdsa", "id_rsa"];
 
-/// Parse OpenSSH config text; unknown directives are ignored.
+/// First word of a config line, lowercased (`Host`, `Match`, ...).
+fn keyword(line: &str) -> String {
+    line.trim_start()
+        .split(|c: char| c.is_whitespace() || c == '=')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// Lines of `text` without `Match` blocks. A block runs from a `Match`
+/// line to the next `Host` or `Match` line.
+fn without_match_blocks(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_match = false;
+    for line in text.lines() {
+        match keyword(line).as_str() {
+            "match" => in_match = true,
+            "host" => in_match = false,
+            _ => {}
+        }
+        if !in_match {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Things in `text` that are ignored and the user should know about: one
+/// entry per `Match` block, with its 1-based line number.
+pub fn config_warnings(text: &str) -> Vec<String> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, l)| keyword(l) == "match")
+        .map(|(i, _)| {
+            format!(
+                "ssh config line {}: Match blocks are not supported; their settings are ignored",
+                i + 1
+            )
+        })
+        .collect()
+}
+
+/// Parse OpenSSH config text; unknown directives and `Match` blocks are
+/// ignored.
 pub fn parse_config(text: &str) -> Result<SshConfig, ConfigError> {
     SshConfig::default()
         .parse(
-            &mut BufReader::new(text.as_bytes()),
+            &mut BufReader::new(without_match_blocks(text).as_bytes()),
             ParseRule::ALLOW_UNKNOWN_FIELDS,
         )
         .map_err(|e| ConfigError(format!("ssh config: {e}")))
@@ -80,21 +128,28 @@ pub fn resolve(
     default_user: &str,
     home: &Path,
 ) -> Result<HostSpec, ConfigError> {
-    resolve_depth(config, target, default_user, home, 0)
+    let mut spec = resolve_hop(config, target, default_user, home)?;
+    let params = config.query(split_target(target)?.1);
+    spec.jumps = params
+        .proxy_jump
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|j| j.split(','))
+        .map(str::trim)
+        .filter(|j| !j.is_empty() && !j.eq_ignore_ascii_case("none"))
+        .map(|j| resolve_hop(config, j, default_user, home))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(spec)
 }
 
-fn resolve_depth(
+/// One host's parameters, without jump hosts.
+fn resolve_hop(
     config: &SshConfig,
     target: &str,
     default_user: &str,
     home: &Path,
-    depth: usize,
 ) -> Result<HostSpec, ConfigError> {
-    if depth > MAX_JUMP_DEPTH {
-        return Err(ConfigError(format!(
-            "ProxyJump chain deeper than {MAX_JUMP_DEPTH} at '{target}' (loop?)"
-        )));
-    }
     let (user, name, port) = split_target(target)?;
     let params = config.query(name);
     let identity_files = params.identity_file.clone().unwrap_or_else(|| {
@@ -103,16 +158,6 @@ fn resolve_depth(
             .map(|k| home.join(".ssh").join(k))
             .collect()
     });
-    let jumps = params
-        .proxy_jump
-        .clone()
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|j| j.split(','))
-        .map(str::trim)
-        .filter(|j| !j.is_empty() && !j.eq_ignore_ascii_case("none"))
-        .map(|j| resolve_depth(config, j, default_user, home, depth + 1))
-        .collect::<Result<Vec<_>, _>>()?;
     Ok(HostSpec {
         alias: target.to_owned(),
         host: params.host_name.clone().unwrap_or_else(|| name.to_owned()),
@@ -122,6 +167,6 @@ fn resolve_depth(
             .or(params.user.clone())
             .unwrap_or_else(|| default_user.to_owned()),
         identity_files,
-        jumps,
+        jumps: Vec::new(),
     })
 }

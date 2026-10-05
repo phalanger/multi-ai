@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use mai_core::ssh::config::{parse_config, resolve};
+use mai_core::ssh::config::{config_warnings, parse_config, resolve};
 
 const CONFIG: &str = "\
 Host mac
@@ -100,10 +100,43 @@ fn unknown_alias_falls_back_to_name_and_default_user() {
 }
 
 #[test]
-fn jump_loop_is_an_error() {
+fn jump_hosts_own_proxyjump_is_not_followed() {
     let cfg = parse_config(CONFIG).unwrap();
-    let err = resolve(&cfg, "loop-a", "me", &home()).unwrap_err();
-    assert!(err.0.contains("ProxyJump"), "{err}");
+    let spec = resolve(&cfg, "loop-a", "me", &home()).unwrap();
+    assert_eq!(spec.jumps.len(), 1);
+    assert_eq!(spec.jumps[0].host, "loop-b");
+    assert!(spec.jumps[0].jumps.is_empty());
+}
+
+const WITH_MATCH: &str = "\
+Host a
+  User alice
+Match host a exec \"true\"
+  User mallory
+  Port 2222
+Host b
+  User bob
+";
+
+#[test]
+fn match_blocks_are_ignored_not_misattributed() {
+    let cfg = parse_config(WITH_MATCH).unwrap();
+    let a = resolve(&cfg, "a", "me", &home()).unwrap();
+    assert_eq!((a.user.as_str(), a.port), ("alice", 22));
+    let b = resolve(&cfg, "b", "me", &home()).unwrap();
+    assert_eq!(b.user, "bob");
+}
+
+#[test]
+fn match_blocks_are_reported() {
+    assert_eq!(
+        config_warnings(WITH_MATCH),
+        vec![
+            "ssh config line 3: Match blocks are not supported; their settings are ignored"
+                .to_owned()
+        ]
+    );
+    assert!(config_warnings(CONFIG).is_empty());
 }
 
 #[test]
