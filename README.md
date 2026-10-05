@@ -36,6 +36,10 @@ cargo clippy --workspace --all-targets -- -D warnings
   into `Update`s (host state, sessions, panes, agents, alerts, metrics).
 - `connect::SystemConnector` reaches SSH hosts (probe on an exec channel) and
   the local machine (probe as a child process, no sshd needed).
+- `HostManager::open_terminal` attaches a terminal to a zellij session
+  (`zellij attach [--create]`) in a PTY: over a per-host terminal SSH
+  connection, or a local PTY (ConPTY on Windows). If the connection drops,
+  terminals get `Detached` and are reattached automatically.
 
 Manual checks (prompts on the terminal, secrets kept in memory):
 
@@ -43,6 +47,7 @@ Manual checks (prompts on the terminal, secrets kept in memory):
 cargo run -p mai-core --example ssh_exec -- <target> '<command>'
 cargo run -p mai-core --example deploy_probe -- <target> <probes-dir> [.mai-e2e] [seconds]
 cargo run -p mai-core --example monitor -- <probes-dir> <seconds> <host>...  # host: local | ssh target
+cargo run -p mai-core --example term -- <probes-dir> <host> <new-session-name>
 ```
 
 Probe binaries for all targets come from CI:
