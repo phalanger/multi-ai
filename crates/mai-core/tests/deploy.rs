@@ -262,9 +262,20 @@ fn powershell_output_of_the_detection_command_is_not_posix() {
     // `uname` is missing (the old, unguarded command).
     let out = "MAI-DETECT-BEGIN\r\nMAI-DETECT-END\r\n";
     assert_eq!(parse_posix_detect(out).unwrap(), None);
-    // The guarded command only prints markers when uname works.
+    // The chain only prints markers when uname works, and has no braces
+    // (fish and PowerShell on Unix cannot parse them).
     let cmd = posix_detect_command();
-    assert!(cmd.starts_with("uname -sm >/dev/null 2>&1 && {"), "{cmd}");
+    assert!(
+        cmd.starts_with("uname -sm >/dev/null && echo MAI-DETECT-BEGIN && "),
+        "{cmd}"
+    );
+    assert!(!cmd.contains('{'), "{cmd}");
+}
+
+#[test]
+fn windows_uname_in_a_marked_block_is_not_posix() {
+    let out = "MAI-DETECT-BEGIN\nMINGW64_NT-10.0-26300 x86_64\n/c/Users/u\nMAI-DETECT-END\n";
+    assert_eq!(parse_posix_detect(out).unwrap(), None);
 }
 #[test]
 fn windows_detection_and_unset_userprofile() {

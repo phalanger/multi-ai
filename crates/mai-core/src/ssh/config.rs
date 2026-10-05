@@ -68,17 +68,22 @@ fn without_match_blocks(text: &str) -> String {
     out
 }
 
-/// Things in `text` that are ignored and the user should know about: one
-/// entry per `Match` block, with its 1-based line number.
+/// Things in `text` the user should know about, with 1-based line
+/// numbers: one entry per `Match` block (ignored) and per `Include` (the
+/// parser follows it, but cannot see `Match` blocks in the included file).
 pub fn config_warnings(text: &str) -> Vec<String> {
     text.lines()
         .enumerate()
-        .filter(|(_, l)| keyword(l) == "match")
-        .map(|(i, _)| {
-            format!(
+        .filter_map(|(i, l)| match keyword(l).as_str() {
+            "match" => Some(format!(
                 "ssh config line {}: Match blocks are not supported; their settings are ignored",
                 i + 1
-            )
+            )),
+            "include" => Some(format!(
+                "ssh config line {}: Include is followed, but Match blocks in included files are not detected; their settings may apply to the preceding Host",
+                i + 1
+            )),
+            _ => None,
         })
         .collect()
 }

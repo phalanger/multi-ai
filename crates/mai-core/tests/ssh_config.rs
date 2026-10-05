@@ -140,6 +140,17 @@ fn match_blocks_are_reported() {
 }
 
 #[test]
+fn include_lines_are_reported() {
+    assert_eq!(
+        config_warnings("Host a\n  User x\nInclude conf.d/*\n"),
+        vec![
+            "ssh config line 3: Include is followed, but Match blocks in included files are not detected; their settings may apply to the preceding Host"
+                .to_owned()
+        ]
+    );
+}
+
+#[test]
 fn bad_port_is_an_error() {
     let cfg = parse_config("").unwrap();
     assert!(resolve(&cfg, "host:notaport", "me", &home()).is_err());

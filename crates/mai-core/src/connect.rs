@@ -25,6 +25,17 @@ use crate::terminals::SystemTerminals;
 /// Locale requested for `serve` so zellij output is UTF-8.
 const LOCALE: &str = "en_US.UTF-8";
 
+/// Append ssh config warnings (an ignored `Match` block may have set the
+/// user or key) to an authentication failure. Other errors are unchanged.
+pub fn with_config_warnings(err: OpenError, warnings: &[String]) -> OpenError {
+    match err {
+        OpenError::NeedsUser(Problem::Auth(m)) if !warnings.is_empty() => {
+            OpenError::NeedsUser(Problem::Auth(format!("{m} ({})", warnings.join("; "))))
+        }
+        other => other,
+    }
+}
+
 /// Map an SSH failure to retry-or-ask-the-user.
 pub fn ssh_open_error(e: SshError) -> OpenError {
     match e {
@@ -221,7 +232,7 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         let guard = gate.lock().await;
         let session = connect(&spec, &self.opts, self.prompter.clone(), &*self.secrets)
             .await
-            .map_err(ssh_open_error)?;
+            .map_err(|e| with_config_warnings(ssh_open_error(e), &notes))?;
         let opts = DeployOptions {
             dir: self.dir.clone(),
             install_hooks: false,
