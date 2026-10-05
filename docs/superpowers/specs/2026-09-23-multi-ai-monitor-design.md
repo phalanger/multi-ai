@@ -92,7 +92,8 @@ stdin/stdout 通信；本机不需要 sshd。
 - 自行解析 `~/.ssh/config`（ssh2-config），
   支持：HostName、User、Port、IdentityFile、ProxyJump。
   - 跳板主机按目标的 `ProxyJump` 逐个解析各自的 HostName、User、Port、
-    IdentityFile；跳板主机自身的 `ProxyJump` 不跟随。
+    IdentityFile；跳板主机自身的 `ProxyJump` 不跟随，配置了时给出一条提示
+    （否则用户只看到连接失败）。
   - `Match` 块不支持：解析前整块去掉（其中的设置不生效），每个 `Match`
     行给出一条提示（文件行号），随连接结果交给 UI 显示（见第 11 节）。
   - `Include` 由 ssh2-config 自行跟随，但被包含文件中的 `Match` 块无法识别
@@ -110,7 +111,8 @@ stdin/stdout 通信；本机不需要 sshd。
    并询问是否保存。
 2. ssh-agent（macOS：`SSH_AUTH_SOCK`；Windows：OpenSSH Agent 命名管道，Pageant 可选）。
    已经按私钥文件试过的公钥不再经 agent 重试，避免白白消耗服务器的 `MaxAuthTries`；
-   但用户拒绝输入口令的私钥仍会经 agent 尝试。
+   但用户拒绝输入口令的私钥仍会经 agent 尝试。`ConnectOptions.use_agent` 可关闭
+   这一步（测试据此不接触开发者自己的 agent）。
 3. 钥匙串中保存的密码。
 4. 弹窗输入密码；keyboard-interactive / 2FA 弹窗逐项交互，最多 10 轮
    （`MAX_KBD_ROUNDS`），超过按该方法失败处理。
@@ -121,8 +123,9 @@ stdin/stdout 通信；本机不需要 sshd。
 密码与口令失效时从钥匙串删除。密码与口令只存系统钥匙串（`keyring` crate），
 服务名 `multi-ai`，键为 `<host>/password` 与 `passphrase:<私钥路径>`；私钥路径先
 规范化（`canonicalize`；Windows 上去掉 `\\?\` 前缀并转为小写），同一私钥的不同
-写法共用一个键。钥匙串写入或删除失败不中断认证，但作为提示交给 UI（见第 11 节）。
-SSH 认证失败时，ssh config 的提示会附加在错误文本之后，便于发现被忽略的 `Match` 块。
+写法共用一个键。旧版本按原样路径保存的口令（`passphrase:<写法>`）在新键下没有
+条目时被读出：能解密则移到新键，并删除旧条目；不能解密也删除旧条目。
+钥匙串写入或删除失败不中断认证，但作为提示交给 UI（见第 11 节）。
 
 ### 3.3 主机密钥校验
 
@@ -136,7 +139,8 @@ SSH 认证失败时，ssh config 的提示会附加在错误文本之后，便�
 - 未知主机：弹窗显示指纹，用户确认后写入应用的 known_hosts；文件中已有同一条
   记录时不重复写入。
 - 指纹不一致：拒绝连接并醒目提示，不提供“忽略”按钮。任一文件记录了同类型的
-  不同密钥即视为不一致，即使另一个文件里有匹配的记录。
+  不同密钥即视为不一致，即使另一个文件里有匹配的记录（比 OpenSSH 严格；
+  密钥轮换后用户需清理 known_hosts 中的旧行。已决定保持）。
 
 ### 3.4 连接状态与重连
 
@@ -152,7 +156,10 @@ SSH 认证失败时，ssh config 的提示会附加在错误文本之后，便�
 - 需要用户处理、不自动重试的原因：认证失败、拒绝主机密钥、主机密钥变化、
   部署失败（如缺少对应平台的探针、上传失败）、配置错误（如 ssh config 无法解析）、
   探针协议版本不符。用户点“重试”后立即重连。
-- 网络类错误（TCP、密钥交换、认证过程中连接断开、通道错误）按退避自动重试。
+- 网络类错误（TCP、密钥交换、认证过程中连接断开、通道错误、探针上传超时）
+  按退避自动重试。
+- 主机被移除后又以同一 id 加入时，旧任务尚未送达的事件被丢弃：每次加入带一个
+  代数，事件按代数过滤。
   探针连续在线超过 30 秒后断开，退避重新从 1 秒开始；刚启动就断开的探针继续加倍等待。
 - hook 安装失败不影响连接：探针照常运行（仅靠抓屏识别），失败原因交给 UI 显示。
 
@@ -206,6 +213,8 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
    4. 尽力删除改名后的旧文件。
 
    SFTP 路径相对登录目录（`.mai/bin/...`）；内置二进制来自 CI 产物 `probes/<target>/`。
+   每个 SFTP 请求最多等 60 秒（russh-sftp 默认 10 秒，慢链路上写探针会超时）；
+   上传超时按网络错误自动重试，其他上传失败等待用户处理。
    SFTP 不可用时回退 exec 写入尚未实现，见
    `docs/superpowers/plans/2026-09-24-02-followups.md`（B18）。
 4. 执行 `mai-probe install-hooks`（幂等）。
@@ -371,24 +380,40 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 - 每个已打开的 `(host, session)` 对应 UI 中一个终端标签，内容为 xterm.js。
 - 远程：TermConn 上开 PTY channel，`TERM=xterm-256color`，执行
   `<zellij> attach [--create] <session>`。zellij 路径依次取主机配置、
-  探针 `Hello` 报告的路径，都没有时用 PATH 中的 `zellij`。
+  探针 `Hello` 报告的路径、建立 TermConn 时在主机上查找到的路径（POSIX 主机：
+  用 `sh -c` 依次查 PATH、`/opt/homebrew/bin`、`/usr/local/bin`、
+  `~/.cargo/bin`、`~/.local/bin`，最后问登录 shell；探针连不上时也能找到
+  非交互 SSH 的 PATH 里没有的 zellij），都没有时用 PATH 中的 `zellij`。
+- session 名为空或以 `-` 开头时拒绝打开（zellij 会把它当成选项）。
 - 远程命令必须使用 UTF-8 locale：经 SSH env 请求发送 `LANG`/`LC_CTYPE`
   并等待服务器答复（最多 10 秒）；服务器拒绝时，POSIX shell 的命令前加
   `LANG=... LC_CTYPE=...`。否则 macOS 上中文输入异常。
+- 建立 PTY 时（pty、env、exec 请求）任何一个请求 10 秒内没有答复即视为失败
+  （否则迟到的答复会被当成下一个请求的答复）；建立失败时关闭该 channel。
+  答复之前到达的输出保留，作为终端的第一段输出。
 - xterm.js 必须加载 `@xterm/addon-clipboard`（zellij 复制走 OSC 52）与
   `@xterm/addon-unicode11`（宽字符宽度与 zellij 一致）。
-- 本机：portable-pty 执行同样命令，环境加 `TERM=xterm-256color`，非 Windows
-  再加 UTF-8 locale（GUI 应用的环境里可能没有）。ConPTY 启动时发出光标位置查询
+- 本机：portable-pty 执行同样命令，环境加 `TERM=xterm-256color`；非 Windows
+  且环境里没有 UTF-8 locale（依次看 `LC_ALL`、`LC_CTYPE`、`LANG`）时再加
+  `LANG`/`LC_CTYPE`（Linux 为 `C.UTF-8`，macOS 为 `en_US.UTF-8`），用户自己的
+  UTF-8 locale（如 `zh_CN.UTF-8`）保持不变。zellij 不在 PATH 中时，同样查找
+  上述常见安装目录。ConPTY 启动时发出光标位置查询
   （`ESC[6n`）并等待答复，由 xterm.js 应答；应用不代为应答，以免答复两次。
 - 窗口尺寸变化同步到 PTY（window-change）。
 - 字节流：PTY 输出经 Tauri event 推给前端，前端键盘输入经 Tauri command 写回 PTY。
 - 每台主机一个终端任务：第一个终端打开时建立 TermConn（持有与探针连接相同的
-  按主机的锁，避免同时弹两次主机密钥确认），最后一个关闭时断开。
+  按主机的锁，避免同时弹两次主机密钥确认），最后一个关闭时断开。连接或 attach
+  期间（可能在等主机密钥、口令确认）仍处理输入、尺寸变化、关闭与停止；
+  同时到来的打开请求排队，依次处理。
 - 终端事件：`Attached`（已连接，zellij 会重绘整屏）、`Output`、
-  `Detached`（连接断开）、`Exited`（`zellij attach` 退出：用户 detach 或退出
-  session，终端结束）。
+  `Detached`（连接或该终端的 channel 断开）、`Exited`（`zellij attach` 退出：
+  用户 detach 或退出 session，终端结束）。
 - TermConn 断开：所有终端收到 `Detached`，按退避重连后以当前尺寸重新 attach，
   再收到 `Attached`。需要用户处理的问题（认证、主机密钥）等待“重试”。
+  退避只在连接稳定 30 秒（与探针连接相同的 `STABLE_AFTER`）后才复位，避免
+  连上即断时每秒重连。连接断开期间打开终端，返回断开的真实原因。
+- 单个终端的 channel 关闭但没有退出状态、而连接仍在时：只重新 attach 这一个
+  终端；若它连续 3 次在 attach 后 30 秒内又关闭，按 `Exited(None)` 结束。
 - 关闭终端即关闭该 PTY（zellij 客户端 detach，session 保留）。
 - 新建的 zellij session 可能先显示“Tips”弹窗，按 ESC 关闭；这是 zellij 的行为，
   UI 不做特殊处理。
@@ -454,10 +479,13 @@ attach 同一 session 并有输入，跳转会作用到那个终端。
 - 探针的 stderr 保留最后 2 KB；探针停止时，把最后几行非空内容附在重试原因后面
   （如规则文件错误），而不是只显示“probe stream closed”。
 - 配置文件解析失败：拒绝启动对应功能并指出文件与行号，不使用默认值覆盖用户文件。
-- 不影响连接但用户应当知道的情况（ssh config 中被忽略的 `Match` 块、钥匙串
-  保存或删除失败）作为提示（notes）随连接结果返回：`Opened.notes` →
-  `HostEvent::Notes` → `Update::Notes`，在 `Hello`、`Hooks` 之后发出，没有提示
-  时不发。多跳连接的提示合并在一起。
+- 不影响连接但用户应当知道的情况（ssh config 中被忽略的 `Match` 块与
+  `Include`、跳板主机未跟随的 `ProxyJump`、钥匙串保存或删除失败）作为提示
+  （notes）随连接结果返回：`Opened.notes` → `HostEvent::Notes` →
+  `Update::Notes`，在 `Hello`、`Hooks` 之后发出，没有提示时不发。多跳连接的
+  提示合并在一起。连接失败时提示不会丢失：附加在失败原因的文本之后
+  （`Retry` 的原因，以及认证、部署、配置问题的文本；主机密钥与协议问题没有文本，
+  不附加）。
 
 ## 12. 测试策略
 
