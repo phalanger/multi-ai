@@ -89,27 +89,49 @@ stdin/stdout 通信；本机不需要 sshd。
 ### 3.1 主机配置
 
 - 在 UI 中手动添加，或从 `~/.ssh/config` 导入 Host 别名。
-- 自行解析 `~/.ssh/config`（ssh2-config；跳板主机自身的 `ProxyJump` 不再展开），
+- 自行解析 `~/.ssh/config`（ssh2-config），
   支持：HostName、User、Port、IdentityFile、ProxyJump。
+  - 跳板主机按目标的 `ProxyJump` 逐个解析各自的 HostName、User、Port、
+    IdentityFile；跳板主机自身的 `ProxyJump` 不跟随。
+  - `Match` 块不支持：解析前整块去掉（其中的设置不生效），每个 `Match`
+    行给出一条提示（文件行号），随连接结果交给 UI 显示（见第 11 节）。
 - 每台主机可选配置：zellij 可执行文件路径、默认 session、探针轮询间隔。
 
 ### 3.2 认证顺序
 
 先以 `none` 查询服务器允许的方法，未提供的方法跳过。
 
-1. 配置或 ssh config 中指定的私钥（口令从钥匙串读取，缺失则弹窗输入并询问是否保存）。
+1. 配置或 ssh config 中指定的私钥：先用公钥询问服务器是否接受（公钥取自
+   `<私钥>.pub`，没有则从未加密的私钥文件读出），服务器接受后才解密私钥并签名；
+   因此服务器不接受的加密私钥不会弹窗要口令。口令从钥匙串读取，缺失则弹窗输入
+   并询问是否保存。
 2. ssh-agent（macOS：`SSH_AUTH_SOCK`；Windows：OpenSSH Agent 命名管道，Pageant 可选）。
+   已经按私钥文件试过的公钥不再经 agent 重试，避免白白消耗服务器的 `MaxAuthTries`。
 3. 钥匙串中保存的密码。
-4. 弹窗输入密码；keyboard-interactive / 2FA 弹窗逐项交互。
+4. 弹窗输入密码；keyboard-interactive / 2FA 弹窗逐项交互，最多 10 轮
+   （`MAX_KBD_ROUNDS`），超过按该方法失败处理。
+
+任一方法得到 partial success（服务器要求再用另一种方法）时，按服务器给出的
+新方法列表继续，而不是当作失败。
 
 密码与口令失效时从钥匙串删除。密码与口令只存系统钥匙串（`keyring` crate），
-服务名 `multi-ai`，键为 `<host>/password` 与 `passphrase:<私钥路径>`。
+服务名 `multi-ai`，键为 `<host>/password` 与 `passphrase:<私钥路径>`；私钥路径先
+规范化（`canonicalize`；Windows 上去掉 `\\?\` 前缀并转为小写），同一私钥的不同
+写法共用一个键。钥匙串写入或删除失败不中断认证，但作为提示交给 UI（见第 11 节）。
 
 ### 3.3 主机密钥校验
 
-- 读取 `~/.ssh/known_hosts`（以及应用自己的 known_hosts 文件）。
-- 未知主机：弹窗显示指纹，用户确认后写入应用的 known_hosts。
-- 指纹不一致：拒绝连接并醒目提示，不提供“忽略”按钮。
+- 读取 `~/.ssh/known_hosts`（以及应用自己的 known_hosts 文件），自行逐行解析：
+  - 无法解析的行（非 UTF-8、坏的 base64、不支持的密钥类型）跳过，与 OpenSSH 一致；
+    文件存在但读取失败（I/O 错误）则拒绝连接，而不是当作没有该文件。
+  - 主机字段支持 `*`、`?` 通配、`!` 否定、`[host]:port` 与哈希主机名
+    （`|1|salt|hash`，HMAC-SHA1）；主机名不区分大小写。
+  - `@revoked` 标记的密钥一律拒绝（优先于其他文件中的匹配）；
+    `@cert-authority` 行忽略（不支持主机证书）。
+- 未知主机：弹窗显示指纹，用户确认后写入应用的 known_hosts；文件中已有同一条
+  记录时不重复写入。
+- 指纹不一致：拒绝连接并醒目提示，不提供“忽略”按钮。任一文件记录了同类型的
+  不同密钥即视为不一致，即使另一个文件里有匹配的记录。
 
 ### 3.4 连接状态与重连
 
@@ -151,24 +173,36 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 
 ### 4.2 部署流程
 
-1. 探测：`uname -sm` 成功为 Linux/macOS；否则以 `echo %OS%` 区分 Windows 的
-   cmd（输出 `Windows_NT`）与 PowerShell（原样输出），再取 CPU 与 home。
+1. 探测：执行 `uname -sm` 与 `printf '%s\n' "$HOME"`，输出包在哨兵行
+   `MAI-DETECT-BEGIN` / `MAI-DETECT-END` 之间，只解析两行之间的内容（登录 shell
+   的 rc 文件多打印的内容不影响结果）；有哨兵且系统受支持为 Linux/macOS，
+   有哨兵但系统不受支持或 home 为空则报探测错误。没有哨兵时以 `echo %OS%` 区分
+   Windows 的 cmd（输出 `Windows_NT`）与 PowerShell（原样输出），再同样在哨兵之间
+   取 CPU 与 home；cmd 下 `%USERPROFILE%` 未定义时会原样回显，按未设置报错。
 2. 以远程命令计算 `<home>/.mai/bin/mai-probe` 的 SHA-256
    （`sha256sum`、`shasum -a 256`、`certutil`、`Get-FileHash`），
    与应用内置二进制比较；一致则跳过上传。
 3. 不一致或不存在：若旧文件存在，先执行旧探针的 `stop --client <id>`（尽力而为，
    旧版本没有该子命令时忽略）；SFTP 上传到 `<exe>.upload`；非 Windows 上 chmod 0755；
-   若目标文件已存在则先删除，再将 `<exe>.upload` 重命名为目标名。
+   再以远程命令计算 `<exe>.upload` 的 SHA-256，与内置二进制不一致则删除它并报
+   部署错误。校验通过后替换（`swap::swap_in`）：
+   1. 删除上次替换留下的 `<exe>.old*`（仍被锁住的留到下次）；
+   2. 目标文件存在则改名为 `<exe>.old`（`.old` 仍被锁住时改为 `.old-<毫秒>`）——
+      Windows 上正在运行的 exe 不能删除但可以改名，因此另一个 client 的 `serve`
+      或短命的 `hook` 进程不会让部署失败；
+   3. 把 `<exe>.upload` 改名为目标名，失败时把旧文件改回原名；
+   4. 尽力删除改名后的旧文件。
+
    SFTP 路径相对登录目录（`.mai/bin/...`）；内置二进制来自 CI 产物 `probes/<target>/`。
-   上传后的校验、以及 SFTP 不可用时回退 exec 写入均尚未实现；
-   “先删后 rename”之间还有一段窗口不是原子的，见
+   SFTP 不可用时回退 exec 写入尚未实现，见
    `docs/superpowers/plans/2026-09-24-02-followups.md`（B18）。
 4. 执行 `mai-probe install-hooks`（幂等）。
 5. 执行 `mai-probe serve --client <id>`。`<id>` 是本应用安装的标识，只保留
    `[A-Za-z0-9_-]`；为空时不传该参数（PowerShell 5.1 会丢弃空参数）。
    远程命令经 SSH env 请求设置 `LANG`、`LC_CTYPE` 为 `en_US.UTF-8`。
 
-本机按同样的步骤处理，只是改为本地文件复制与子进程（见 2.2）。
+本机按同样的步骤处理，只是改为本地文件复制与子进程（见 2.2）；替换同样经
+`swap::swap_in`（本地文件系统实现）。
 
 ### 4.3 spool 目录
 
@@ -408,6 +442,10 @@ attach 同一 session 并有输入，跳转会作用到那个终端。
 - 探针的 stderr 保留最后 2 KB；探针停止时，把最后几行非空内容附在重试原因后面
   （如规则文件错误），而不是只显示“probe stream closed”。
 - 配置文件解析失败：拒绝启动对应功能并指出文件与行号，不使用默认值覆盖用户文件。
+- 不影响连接但用户应当知道的情况（ssh config 中被忽略的 `Match` 块、钥匙串
+  保存或删除失败）作为提示（notes）随连接结果返回：`Opened.notes` →
+  `HostEvent::Notes` → `Update::Notes`，在 `Hello`、`Hooks` 之后发出，没有提示
+  时不发。多跳连接的提示合并在一起。
 
 ## 12. 测试策略
 
