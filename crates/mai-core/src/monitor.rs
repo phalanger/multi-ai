@@ -52,6 +52,11 @@ pub enum Update {
         code: String,
         message: String,
     },
+    /// Things the user should know about a host that did not stop it.
+    Notes {
+        id: String,
+        notes: Vec<String>,
+    },
     /// A command could not be delivered because the probe was down.
     Dropped {
         id: String,
@@ -134,6 +139,7 @@ impl Monitor {
                 vec![Update::Hello { id, info }]
             }
             HostEvent::Hooks(result) => vec![Update::Hooks { id, result }],
+            HostEvent::Notes(notes) => vec![Update::Notes { id, notes }],
             HostEvent::Dropped(msg) => vec![Update::Dropped { id, msg }],
             HostEvent::Msg(msg) => self.apply_msg(id, msg, now_ms),
         }

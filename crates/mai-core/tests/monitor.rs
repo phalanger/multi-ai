@@ -282,3 +282,16 @@ fn metrics_errors_and_heartbeats() {
             .is_empty()
     );
 }
+
+#[test]
+fn notes_are_passed_through() {
+    let mut m = monitor();
+    let out = m.apply("h", HostEvent::Notes(vec!["n".into()]), 0);
+    assert_eq!(
+        out,
+        vec![Update::Notes {
+            id: "h".into(),
+            notes: vec!["n".into()]
+        }]
+    );
+}

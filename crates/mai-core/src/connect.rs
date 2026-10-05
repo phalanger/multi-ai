@@ -3,7 +3,6 @@
 //! copied into the home directory and `serve` started as a child process.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -18,7 +17,7 @@ use crate::host::{Connector, HostConfig, HostKind, OpenError, Opened, Problem};
 use crate::link::ProbeIo;
 use crate::ssh::auth::{Prompter, SecretStore};
 use crate::ssh::client::{ConnectOptions, ExecOutput, SshError, connect};
-use crate::ssh::config::{HostSpec, parse_config, resolve};
+use crate::ssh::config::{HostSpec, config_warnings, parse_config, resolve};
 use crate::stderr::{StderrTail, collect as collect_stderr};
 use crate::swap::{LocalFiles, swap_in};
 use crate::terminals::SystemTerminals;
@@ -82,7 +81,7 @@ pub fn local_remote(home: &Path) -> Option<Remote> {
 pub async fn place_binary(
     exe: &Path,
     bytes: &[u8],
-    stop: impl Future<Output = ()>,
+    stop: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<bool> {
     let existing = tokio::fs::read(exe).await.ok();
     if existing.as_deref().map(sha256_hex) == Some(sha256_hex(bytes)) {
@@ -194,7 +193,8 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         gates.entry(id.to_owned()).or_default().clone()
     }
 
-    fn spec(&self, target: &str) -> Result<HostSpec, OpenError> {
+    /// The resolved target and the config warnings (ignored `Match` blocks).
+    fn spec(&self, target: &str) -> Result<(HostSpec, Vec<String>), OpenError> {
         let text = match &self.ssh_config {
             None => String::new(),
             Some(p) => match std::fs::read_to_string(p) {
@@ -210,12 +210,13 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         };
         let config = parse_config(&text)
             .map_err(|e| OpenError::NeedsUser(Problem::Config(e.to_string())))?;
-        resolve(&config, target, &self.default_user, &self.home)
-            .map_err(|e| OpenError::NeedsUser(Problem::Config(e.to_string())))
+        let spec = resolve(&config, target, &self.default_user, &self.home)
+            .map_err(|e| OpenError::NeedsUser(Problem::Config(e.to_string())))?;
+        Ok((spec, config_warnings(&text)))
     }
 
     async fn open_ssh(&self, host: &HostConfig, target: &str) -> Result<Opened, OpenError> {
-        let spec = self.spec(target)?;
+        let (spec, mut notes) = self.spec(target)?;
         let gate = self.gate(&host.id);
         let guard = gate.lock().await;
         let session = connect(&spec, &self.opts, self.prompter.clone(), &*self.secrets)
@@ -229,6 +230,7 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         let report = deploy(&session, &self.probes, &opts)
             .await
             .map_err(deploy_open_error)?;
+        notes.extend(session.notes().iter().cloned());
         let remote = &report.remote;
         let hooks = if self.install_hooks {
             let cmd = remote.invoke(&report.probe_path, "install-hooks");
@@ -255,8 +257,9 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
                 writer: w,
             },
             hooks,
-            keep: Box::new(session),
             stderr,
+            notes,
+            keep: Box::new(session),
         })
     }
 
@@ -312,6 +315,7 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
             hooks,
             keep: Box::new(child),
             stderr,
+            notes: Vec::new(),
         })
     }
 }
@@ -325,7 +329,7 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         host: &HostConfig,
         target: &str,
     ) -> Result<SystemTerminals<P>, OpenError> {
-        let spec = self.spec(target)?;
+        let (spec, _) = self.spec(target)?;
         let gate = self.gate(&host.id);
         let _guard = gate.lock().await;
         let session = connect(&spec, &self.opts, self.prompter.clone(), &*self.secrets)

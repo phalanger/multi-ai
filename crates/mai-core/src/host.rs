@@ -102,6 +102,9 @@ pub struct Opened {
     pub keep: Box<dyn Any + Send>,
     /// The probe's stderr, to explain why it stopped.
     pub stderr: Arc<StderrTail>,
+    /// Things the user should know that did not stop the connection
+    /// (ignored ssh config blocks, keychain errors).
+    pub notes: Vec<String>,
 }
 
 /// `reason`, followed by the end of the probe's stderr if it wrote any.
@@ -223,6 +226,8 @@ pub enum HostEvent {
     Dropped(AppMsg),
     /// Terminal connection state; `None` while no terminal is open.
     Term(Option<ConnState>),
+    /// Notes from the latest connect (see `Opened::notes`).
+    Notes(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -371,6 +376,9 @@ impl<C: Connector> Host<C> {
                         Ok(hello) => {
                             self.emit(HostEvent::Hello(hello));
                             self.emit(HostEvent::Hooks(opened.hooks));
+                            if !opened.notes.is_empty() {
+                                self.emit(HostEvent::Notes(opened.notes));
+                            }
                             self.emit(HostEvent::Probe(ConnState::Up));
                             let up_since = Instant::now();
                             let Some(e) = self.serve(&mut link).await else {

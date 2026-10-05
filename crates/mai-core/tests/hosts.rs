@@ -108,6 +108,8 @@ struct Scripted {
     attaches_rx: Mutex<Option<UnboundedReceiver<Attach>>>,
     /// Stderr of every probe this connector starts.
     stderr: Arc<StderrTail>,
+    /// Notes every probe this connector starts reports.
+    notes: Mutex<Vec<String>>,
 }
 
 impl Scripted {
@@ -121,6 +123,7 @@ impl Scripted {
             attaches,
             attaches_rx: Mutex::new(Some(attaches_rx)),
             stderr: Arc::default(),
+            notes: Mutex::default(),
         };
         (Arc::new(c), rx)
     }
@@ -165,6 +168,7 @@ impl Connector for Scripted {
                     },
                     hooks: Ok(Vec::new()),
                     keep: Box::new(()),
+                    notes: self.notes.lock().unwrap().clone(),
                     stderr: self.stderr.clone(),
                 })
             }
@@ -631,4 +635,25 @@ async fn dropping_the_manager_ends_open_terminals() {
         .await
         .expect("terminal stream ended");
     assert_eq!(end, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn connect_notes_are_reported_after_hello() {
+    let (c, probes) = Scripted::new(vec![Step::Probe]);
+    c.notes
+        .lock()
+        .unwrap()
+        .push("ssh config line 3: Match blocks are not supported".into());
+    let mut h = Harness::start(c, probes);
+    assert_eq!(h.state().await, ConnState::Connecting);
+    h.probe().await.hello(PROTOCOL_VERSION).await;
+    assert!(matches!(h.event().await, HostEvent::Hello(_)));
+    assert!(matches!(h.event().await, HostEvent::Hooks(_)));
+    assert_eq!(
+        h.event().await,
+        HostEvent::Notes(vec![
+            "ssh config line 3: Match blocks are not supported".into()
+        ])
+    );
+    assert_eq!(h.event().await, HostEvent::Probe(ConnState::Up));
 }
