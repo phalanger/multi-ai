@@ -270,6 +270,8 @@ fn powershell_output_of_the_detection_command_is_not_posix() {
         "{cmd}"
     );
     assert!(!cmd.contains('{'), "{cmd}");
+    assert!(!cmd.contains('\n'), "{cmd:?}");
+    assert!(cmd.contains(r"printf '%s\n'"), "{cmd}");
 }
 
 #[test]

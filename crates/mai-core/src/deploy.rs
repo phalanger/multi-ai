@@ -354,7 +354,7 @@ pub const END_MARK: &str = "MAI-DETECT-END";
 /// the chain as written.
 pub fn posix_detect_command() -> String {
     format!(
-        "uname -sm >/dev/null && echo {BEGIN_MARK} && uname -sm && printf '%s\n' \"$HOME\" && echo {END_MARK}"
+        "uname -sm >/dev/null && echo {BEGIN_MARK} && uname -sm && printf '%s\\n' \"$HOME\" && echo {END_MARK}"
     )
 }
 
