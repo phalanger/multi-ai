@@ -173,10 +173,13 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 
 ### 4.2 部署流程
 
-1. 探测：执行 `uname -sm` 与 `printf '%s\n' "$HOME"`，输出包在哨兵行
-   `MAI-DETECT-BEGIN` / `MAI-DETECT-END` 之间，只解析两行之间的内容（登录 shell
+1. 探测：执行一条 POSIX 命令 `uname -sm >/dev/null 2>&1 && { echo MAI-DETECT-BEGIN;
+   uname -sm; printf '%s\n' "$HOME"; echo MAI-DETECT-END; }`，哨兵行
+   `MAI-DETECT-BEGIN` / `MAI-DETECT-END` 只在 `uname` 成功时才打印（Windows
+   PowerShell 5.1 不认 `&&`，cmd 没有 `uname`，都不会输出哨兵块），只解析两行之间的内容（登录 shell
    的 rc 文件多打印的内容不影响结果）；有哨兵且系统受支持为 Linux/macOS，
-   有哨兵但系统不受支持或 home 为空则报探测错误。没有哨兵时以 `echo %OS%` 区分
+   有哨兵但系统不受支持或 home 为空则报探测错误；哨兵之间为空也视为非 POSIX。
+   没有哨兵时以 `echo %OS%` 区分
    Windows 的 cmd（输出 `Windows_NT`）与 PowerShell（原样输出），再同样在哨兵之间
    取 CPU 与 home；cmd 下 `%USERPROFILE%` 未定义时会原样回显，按未设置报错。
 2. 以远程命令计算 `<home>/.mai/bin/mai-probe` 的 SHA-256
@@ -184,13 +187,13 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
    与应用内置二进制比较；一致则跳过上传。
 3. 不一致或不存在：若旧文件存在，先执行旧探针的 `stop --client <id>`（尽力而为，
    旧版本没有该子命令时忽略）；SFTP 上传到 `<exe>.upload`；非 Windows 上 chmod 0755；
-   再以远程命令计算 `<exe>.upload` 的 SHA-256，与内置二进制不一致则删除它并报
+   再以远程命令计算 `<exe>.upload` 的 SHA-256（远程算不出哈希时报"无法计算 SHA-256"，与内置二进制不一致时报"不匹配"），两种情况都删除它并报
    部署错误。校验通过后替换（`swap::swap_in`）：
    1. 删除上次替换留下的 `<exe>.old*`（仍被锁住的留到下次）；
    2. 目标文件存在则改名为 `<exe>.old`（`.old` 仍被锁住时改为 `.old-<毫秒>`）——
       Windows 上正在运行的 exe 不能删除但可以改名，因此另一个 client 的 `serve`
       或短命的 `hook` 进程不会让部署失败；
-   3. 把 `<exe>.upload` 改名为目标名，失败时把旧文件改回原名；
+   3. 把 `<exe>.upload` 改名为目标名，失败时把旧文件改回原名（改回也失败时错误同时给出两个原因）；
    4. 尽力删除改名后的旧文件。
 
    SFTP 路径相对登录目录（`.mai/bin/...`）；内置二进制来自 CI 产物 `probes/<target>/`。

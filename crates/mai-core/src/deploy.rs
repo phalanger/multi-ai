@@ -345,10 +345,14 @@ pub const BEGIN_MARK: &str = "MAI-DETECT-BEGIN";
 pub const END_MARK: &str = "MAI-DETECT-END";
 
 /// One POSIX command printing `uname -sm` and `$HOME` between markers.
-/// Under cmd the whole line is echoed back on one line, and under
-/// PowerShell `uname` fails, so neither yields the marked lines.
+/// The markers are printed only when `uname` works: Windows PowerShell
+/// 5.1 rejects `&&` as a syntax error and cmd cannot run `uname`, so
+/// neither prints a marked block (a plain `echo` of the markers would
+/// succeed under PowerShell even though `uname` fails).
 pub fn posix_detect_command() -> String {
-    format!("echo {BEGIN_MARK}; uname -sm; printf '%s\\n' \"$HOME\"; echo {END_MARK}")
+    format!(
+        "uname -sm >/dev/null 2>&1 && {{ echo {BEGIN_MARK}; uname -sm; printf '%s\\n' \"$HOME\"; echo {END_MARK}; }}"
+    )
 }
 
 /// Detection commands per Windows shell: CPU and home between markers.
@@ -379,11 +383,15 @@ pub fn marked_lines(out: &str) -> Option<Vec<String>> {
 }
 
 /// OS, CPU and home from `posix_detect_command` output. `Ok(None)` when
-/// the output is not from a POSIX shell (no markers).
+/// the output is not from a POSIX shell (no markers, or an empty marked
+/// block as a non-POSIX shell prints it).
 pub fn parse_posix_detect(out: &str) -> Result<Option<(Os, String, String)>, DeployError> {
     let Some(lines) = marked_lines(out) else {
         return Ok(None);
     };
+    if lines.is_empty() {
+        return Ok(None);
+    }
     let [uname, home] = lines.as_slice() else {
         return Err(DeployError::Detect(format!(
             "unexpected detection output: {lines:?}"
@@ -494,12 +502,19 @@ async fn upload<P: Prompter>(
             .map_err(upload_err)?;
     }
     let tmp_abs = format!("{}.upload", remote.probe_path(dir));
-    let written = parse_hash(&s.exec(&remote.hash_command(&tmp_abs)).await?.stdout_str());
-    if written.as_deref() != Some(sha256_hex(bytes).as_str()) {
+    let out = s.exec(&remote.hash_command(&tmp_abs)).await?;
+    let Some(written) = parse_hash(&out.stdout_str()) else {
         let _ = sftp.remove_file(tmp).await;
         return Err(DeployError::Upload(format!(
-            "uploaded file does not match (SHA-256 {})",
-            written.unwrap_or_else(|| "unknown".into())
+            "cannot compute SHA-256 of {tmp_abs} on the host (exit {:?}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    };
+    if written != sha256_hex(bytes) {
+        let _ = sftp.remove_file(tmp).await;
+        return Err(DeployError::Upload(format!(
+            "uploaded file does not match (SHA-256 {written})"
         )));
     }
     swap_in(&SftpFiles(&sftp), &bin_dir, remote.exe_name(), now_ms())

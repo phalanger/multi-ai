@@ -257,6 +257,16 @@ fn posix_detection_errors_name_the_problem() {
 }
 
 #[test]
+fn powershell_output_of_the_detection_command_is_not_posix() {
+    // Real Windows PowerShell output when the markers are echoed but
+    // `uname` is missing (the old, unguarded command).
+    let out = "MAI-DETECT-BEGIN\r\nMAI-DETECT-END\r\n";
+    assert_eq!(parse_posix_detect(out).unwrap(), None);
+    // The guarded command only prints markers when uname works.
+    let cmd = posix_detect_command();
+    assert!(cmd.starts_with("uname -sm >/dev/null 2>&1 && {"), "{cmd}");
+}
+#[test]
 fn windows_detection_and_unset_userprofile() {
     let ok = "MAI-DETECT-BEGIN\r\nAMD64\r\nC:\\Users\\u\r\nMAI-DETECT-END\r\n";
     assert_eq!(

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use mai_core::swap::{LocalFiles, swap_in};
+use mai_core::swap::{BinFiles, LocalFiles, swap_in};
 
 fn names(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
@@ -88,4 +88,44 @@ async fn running_executable_is_replaced_on_windows() {
         .await
         .unwrap();
     assert_eq!(names(dir.path()), vec!["mai-probe.exe"]);
+}
+
+/// A file system where the old binary exists but renames into the target
+/// name fail, so neither the swap nor the restore can succeed.
+struct BrokenRenames;
+
+impl BinFiles for BrokenRenames {
+    async fn exists(&self, path: &str) -> std::io::Result<bool> {
+        Ok(path == "d/mai-probe")
+    }
+
+    async fn remove(&self, _path: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        if to == "d/mai-probe" {
+            let kind = std::io::ErrorKind::PermissionDenied;
+            return Err(std::io::Error::new(kind, format!("locked {from}")));
+        }
+        Ok(())
+    }
+
+    async fn list(&self, _dir: &str) -> std::io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn failed_restore_is_reported_with_both_errors() {
+    let e = swap_in(&BrokenRenames, "d", "mai-probe", 9)
+        .await
+        .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    let m = e.to_string();
+    assert!(m.contains("locked d/mai-probe.upload"), "{m}");
+    assert!(
+        m.contains("restoring d/mai-probe.old also failed: locked d/mai-probe.old"),
+        "{m}"
+    );
 }

@@ -40,8 +40,13 @@ pub async fn swap_in<F: BinFiles>(files: &F, dir: &str, exe: &str, stamp: u64) -
     }
     if let Err(e) = files.rename(&tmp, &target).await {
         // Put the old binary back so the host keeps a working probe.
-        if let Some(name) = &aside {
-            let _ = files.rename(name, &target).await;
+        if let Some(name) = &aside
+            && let Err(re) = files.rename(name, &target).await
+        {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("{e}; restoring {name} also failed: {re}"),
+            ));
         }
         return Err(e);
     }
