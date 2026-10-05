@@ -81,7 +81,7 @@ pub fn local_remote(home: &Path) -> Option<Remote> {
 pub async fn place_binary(
     exe: &Path,
     bytes: &[u8],
-    stop: impl std::future::Future<Output = ()>,
+    stop: impl Future<Output = ()>,
 ) -> std::io::Result<bool> {
     let existing = tokio::fs::read(exe).await.ok();
     if existing.as_deref().map(sha256_hex) == Some(sha256_hex(bytes)) {
