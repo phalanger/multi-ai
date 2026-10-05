@@ -55,6 +55,13 @@ pub enum SshError {
         file: PathBuf,
         line: usize,
     },
+    /// known_hosts marks this host key `@revoked`: never connect.
+    HostKeyRevoked {
+        host: String,
+        port: u16,
+        file: PathBuf,
+        line: usize,
+    },
     /// No authentication method succeeded: the server ran out of methods
     /// to offer. Not retryable by reconnecting; needs the user to supply
     /// different credentials. The 03b host manager treats this as
@@ -82,6 +89,16 @@ impl fmt::Display for SshError {
             } => write!(
                 f,
                 "HOST KEY CHANGED for {host}:{port} (see {}:{line}); refusing to connect",
+                file.display()
+            ),
+            Self::HostKeyRevoked {
+                host,
+                port,
+                file,
+                line,
+            } => write!(
+                f,
+                "host key for {host}:{port} is REVOKED (see {}:{line}); refusing to connect",
                 file.display()
             ),
             Self::Auth(m) => write!(f, "authentication: {m}"),
@@ -160,6 +177,15 @@ impl<P: Prompter> client::Handler for Checker<P> {
             HostKeyStatus::Known => Ok(true),
             HostKeyStatus::Changed { file, line } => {
                 self.refuse(SshError::HostKeyChanged {
+                    host: self.host.clone(),
+                    port: self.port,
+                    file,
+                    line,
+                });
+                Ok(false)
+            }
+            HostKeyStatus::Revoked { file, line } => {
+                self.refuse(SshError::HostKeyRevoked {
                     host: self.host.clone(),
                     port: self.port,
                     file,

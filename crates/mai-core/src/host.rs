@@ -46,6 +46,8 @@ pub enum Problem {
     HostKeyRejected,
     /// The host key differs from a recorded one.
     HostKeyChanged { file: PathBuf, line: usize },
+    /// A known_hosts file marks the host key `@revoked`.
+    HostKeyRevoked { file: PathBuf, line: usize },
     /// The probe could not be put on the host.
     Deploy(String),
     /// The host's configuration cannot be used (e.g. ssh config error).
@@ -62,6 +64,11 @@ impl fmt::Display for Problem {
             Self::HostKeyChanged { file, line } => write!(
                 f,
                 "HOST KEY CHANGED (recorded in {} line {line})",
+                file.display()
+            ),
+            Self::HostKeyRevoked { file, line } => write!(
+                f,
+                "host key REVOKED (marked in {} line {line})",
                 file.display()
             ),
             Self::Deploy(m) => write!(f, "probe deployment failed: {m}"),
@@ -147,7 +154,10 @@ fn needs_auth(c: &ConnState) -> bool {
     matches!(
         c,
         ConnState::NeedsUser(
-            Problem::Auth(_) | Problem::HostKeyRejected | Problem::HostKeyChanged { .. }
+            Problem::Auth(_)
+                | Problem::HostKeyRejected
+                | Problem::HostKeyChanged { .. }
+                | Problem::HostKeyRevoked { .. }
         )
     )
 }

@@ -99,3 +99,19 @@ fn binary_is_placed_only_when_it_differs() {
         assert_eq!(mode & 0o777, 0o755);
     }
 }
+
+#[test]
+fn revoked_host_key_needs_the_user() {
+    assert_eq!(
+        ssh_open_error(SshError::HostKeyRevoked {
+            host: "h".into(),
+            port: 22,
+            file: PathBuf::from("kh"),
+            line: 4,
+        }),
+        OpenError::NeedsUser(Problem::HostKeyRevoked {
+            file: PathBuf::from("kh"),
+            line: 4
+        })
+    );
+}

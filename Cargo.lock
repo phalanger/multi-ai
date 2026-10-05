@@ -1349,6 +1349,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "mai-core"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "keyring",
  "mai-protocol",
  "portable-pty",
@@ -1357,7 +1358,9 @@ dependencies = [
  "russh-sftp",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
+ "signature",
  "ssh-key",
  "ssh2-config",
  "tempfile",

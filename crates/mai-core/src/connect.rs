@@ -33,6 +33,9 @@ pub fn ssh_open_error(e: SshError) -> OpenError {
         SshError::HostKeyChanged { file, line, .. } => {
             OpenError::NeedsUser(Problem::HostKeyChanged { file, line })
         }
+        SshError::HostKeyRevoked { file, line, .. } => {
+            OpenError::NeedsUser(Problem::HostKeyRevoked { file, line })
+        }
     }
 }
 
