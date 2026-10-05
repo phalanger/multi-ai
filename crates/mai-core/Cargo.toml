@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 keyring = "4"
 mai-protocol = { workspace = true }
+portable-pty = "0.9"
 russh = { version = "0.63", default-features = false, features = ["flate2", "ring", "rsa"] }
 russh-sftp = "3"
 serde = { workspace = true }

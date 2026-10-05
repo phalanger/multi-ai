@@ -6,5 +6,6 @@ pub mod host;
 pub mod link;
 pub mod manager;
 pub mod monitor;
+pub mod pty;
 pub mod ssh;
 pub mod tracker;
