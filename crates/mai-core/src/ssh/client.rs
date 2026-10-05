@@ -21,6 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::auth::{KbdPrompt, Prompter, SecretStore, passphrase_key, password_key};
 use super::config::HostSpec;
 use super::hostkey::{self, HostKeyStatus};
+use crate::pty::{PtyIo, TermSize};
 
 /// Where host keys are checked and learned, and how long to wait.
 #[derive(Debug, Clone)]
@@ -626,6 +627,20 @@ impl<P: Prompter> SshSession<P> {
         }
         ch.exec(true, command).await.map_err(chan_err)?;
         Ok(ch)
+    }
+
+    /// Run a command in a PTY of `size` (terminal type `xterm-256color`).
+    /// The variables in `env` are requested first and each answer is
+    /// awaited; `command` receives whether all were accepted, so it can
+    /// fall back to setting them in the command line.
+    pub async fn open_pty(
+        &self,
+        size: TermSize,
+        env: &[(&str, &str)],
+        command: impl FnOnce(bool) -> String,
+    ) -> Result<PtyIo, SshError> {
+        let ch = self.handle.channel_open_session().await.map_err(chan_err)?;
+        super::pty::start(ch, size, env, command).await
     }
 
     /// Open an SFTP session. Relative paths are relative to the login
