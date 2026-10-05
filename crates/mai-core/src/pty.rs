@@ -101,6 +101,7 @@ pub fn spawn_local(
     let mut reader = pair.master.try_clone_reader().map_err(pty_err)?;
     let mut writer = pair.master.take_writer().map_err(pty_err)?;
     let mut killer = child.clone_killer();
+    let mut reader_killer = child.clone_killer();
     let master = pair.master;
     let (io, ends) = pty_channels();
     let PtyEnds {
@@ -110,6 +111,8 @@ pub fn spawn_local(
 
     // Input thread: owns the master, so dropping it (on close or after the
     // program exits) closes the PTY; on Windows that is what ends output.
+    // It also ends when the app drops its sender or a write fails, and then
+    // kills the program so nothing is left running unattended.
     let input_thread = thread::spawn(move || {
         while let Some(msg) = in_rx.blocking_recv() {
             match msg {
@@ -121,26 +124,29 @@ pub fn spawn_local(
                 PtyIn::Resize(s) => {
                     let _ = master.resize(pty_size(s));
                 }
-                PtyIn::Close => {
-                    let _ = killer.kill();
-                    break;
-                }
+                PtyIn::Close => break,
             }
         }
+        let _ = killer.kill();
         drop(writer);
         drop(master);
     });
 
     // Waiter thread: the exit status, then wake the input thread so it
-    // drops the master (killing an exited program is harmless).
-    let wake = io.input.clone();
+    // drops the master (killing an exited program is harmless). The sender
+    // is weak so it does not keep the input thread alive once the app drops
+    // its own.
+    let wake = io.input.downgrade();
     let waiter = thread::spawn(move || {
         let status = child.wait().ok().map(|s| s.exit_code());
-        let _ = wake.send(PtyIn::Close);
+        if let Some(tx) = wake.upgrade() {
+            let _ = tx.send(PtyIn::Close);
+        }
         status
     });
 
-    // Reader thread: all output, then the exit status once output ends.
+    // Reader thread: all output, then the exit status once output ends. If
+    // the app dropped its receiver, kill the program so the wait can end.
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
@@ -148,6 +154,7 @@ pub fn spawn_local(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if out_tx.send(PtyOut::Data(buf[..n].to_vec())).is_err() {
+                        let _ = reader_killer.kill();
                         break;
                     }
                 }

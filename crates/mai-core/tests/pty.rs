@@ -101,3 +101,41 @@ async fn missing_program_is_an_error() {
     let r = spawn_local(&OsString::from("mai-no-such-program-xyz"), &[], &[], SIZE);
     assert!(r.is_err());
 }
+
+/// Dropping both ends without `Close` must not leave the program running.
+/// Unix only: the program's pid is read from its output and probed with
+/// `kill -0`, which has no reliable equivalent for a ConPTY child.
+#[cfg(unix)]
+#[tokio::test]
+async fn dropping_the_pty_ends_the_program() {
+    let args = vec!["-c".to_owned(), "echo $$; sleep 30".to_owned()];
+    let mut io = spawn_local(&OsString::from("sh"), &args, &[], SIZE).expect("spawn in pty");
+    let mut text = String::new();
+    let pid = loop {
+        match timeout(Duration::from_secs(10), io.output.recv()).await {
+            Ok(Some(PtyOut::Data(d))) => text.push_str(&String::from_utf8_lossy(&d)),
+            other => panic!("no pid; got {other:?}, text {text:?}"),
+        }
+        if let Some(line) = text.lines().find(|l| l.trim().parse::<u32>().is_ok()) {
+            break line.trim().to_owned();
+        }
+    };
+    drop(io);
+    let start = std::time::Instant::now();
+    loop {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !alive {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "pid {pid} still alive"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
