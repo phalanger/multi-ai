@@ -23,17 +23,25 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## mai-core
 
 - `ssh::config::resolve` turns an alias or `user@host:port` into a `HostSpec`
-  using `~/.ssh/config` (HostName, User, Port, IdentityFile, ProxyJump).
-- `ssh::client::connect` authenticates with key files, ssh-agent, remembered
-  or prompted password, then keyboard-interactive; unknown host keys are
-  confirmed through `Prompter`, changed keys are refused.
-- `deploy::deploy` uploads the matching probe (skipped when SHA-256 matches)
-  and runs `install-hooks`.
+  using `~/.ssh/config` (HostName, User, Port, IdentityFile, ProxyJump; a
+  jump host's own ProxyJump is not followed). `Match` blocks are ignored and
+  reported by `config_warnings`.
+- `ssh::client::connect` authenticates with key files (the public key is
+  offered first; an encrypted key is decrypted only once the server accepts
+  it), ssh-agent, remembered or prompted password, then keyboard-interactive.
+  Host keys are checked against known_hosts (hashed names, globs, `@revoked`);
+  unknown keys are confirmed through `Prompter`, changed or revoked keys are
+  refused.
+- `deploy::deploy` uploads the matching probe (skipped when SHA-256 matches),
+  checks the uploaded file's SHA-256 on the host, swaps it in by moving the
+  old binary aside (`swap::swap_in`, works while it runs on Windows) and runs
+  `install-hooks`.
 - `manager::HostManager` runs one task per host (`host::run_host`): connect,
   deploy, start `serve`, relay messages, reconnect with backoff (1 s doubling
   to 60 s). Problems that need the user (authentication, host keys, deploy,
   config, protocol) wait for `retry`. `monitor::Monitor` merges all hosts
-  into `Update`s (host state, sessions, panes, agents, alerts, metrics).
+  into `Update`s (host state, sessions, panes, agents, alerts, metrics,
+  connect notes).
 - `connect::SystemConnector` reaches SSH hosts (probe on an exec channel) and
   the local machine (probe as a child process, no sshd needed).
 - `HostManager::open_terminal` attaches a terminal to a zellij session
