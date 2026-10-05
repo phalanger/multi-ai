@@ -297,3 +297,26 @@ async fn channel_closed_without_exit_status_is_a_lost_connection() {
     io.input.send(PtyIn::Data(b"drop".to_vec())).unwrap();
     assert_eq!(end(&mut io).await, None, "no Exit: the connection was lost");
 }
+
+#[tokio::test]
+async fn exec_split_separates_stdout_from_stderr() {
+    use mai_core::stderr::StderrTail;
+    use tokio::io::AsyncReadExt;
+
+    let (s, _log, _dir) = session(true).await;
+    let tail = Arc::new(StderrTail::default());
+    let (mut out, _stdin) = s
+        .open_exec_split("two-streams", &[], tail.clone())
+        .await
+        .unwrap();
+    let mut text = String::new();
+    timeout(Duration::from_secs(10), out.read_to_string(&mut text))
+        .await
+        .expect("stdout ends")
+        .unwrap();
+    assert_eq!(text, "out-1\nout-2\n");
+    assert_eq!(
+        tail.summary().await.as_deref(),
+        Some("warn: first | error: bad rules")
+    );
+}

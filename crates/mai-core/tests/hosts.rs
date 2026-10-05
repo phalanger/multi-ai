@@ -14,6 +14,7 @@ use mai_core::host::{
 use mai_core::link::ProbeIo;
 use mai_core::manager::HostManager;
 use mai_core::monitor::Update;
+use mai_core::stderr::StderrTail;
 use mai_core::tracker::{AgentKey, TrackerConfig};
 use mai_protocol::{
     AgentEvent, AgentState, AppMsg, EventSource, PROTOCOL_VERSION, PaneRef, ProbeMsg, decode_line,
@@ -68,6 +69,8 @@ struct Scripted {
     steps: Mutex<VecDeque<Step>>,
     opens: AtomicUsize,
     probes: UnboundedSender<FakeProbe>,
+    /// Stderr of every probe this connector starts.
+    stderr: Arc<StderrTail>,
 }
 
 impl Scripted {
@@ -77,6 +80,7 @@ impl Scripted {
             steps: Mutex::new(steps.into()),
             opens: AtomicUsize::new(0),
             probes,
+            stderr: Arc::default(),
         };
         (Arc::new(c), rx)
     }
@@ -108,6 +112,7 @@ impl Connector for Scripted {
                     },
                     hooks: Ok(Vec::new()),
                     keep: Box::new(()),
+                    stderr: self.stderr.clone(),
                 })
             }
         }
@@ -479,5 +484,27 @@ async fn dropping_the_manager_ends_the_update_stream() {
             Ok(None) => break,
             Err(_) => panic!("update stream did not end"),
         }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn probe_stderr_explains_why_it_stopped() {
+    let (c, probes) = Scripted::new(vec![Step::Probe]);
+    let mut h = Harness::start(c.clone(), probes);
+    assert_eq!(h.state().await, ConnState::Connecting);
+    let probe = h.probe().await;
+    c.stderr
+        .push(b"mai-probe serve: rules.toml: invalid regex\n");
+    c.stderr.finish();
+    drop(probe);
+    match h.state().await {
+        ConnState::Retrying { reason, .. } => {
+            assert!(reason.contains("closed"), "{reason}");
+            assert!(
+                reason.contains("probe stderr: mai-probe serve: rules.toml: invalid regex"),
+                "{reason}"
+            );
+        }
+        other => panic!("{other:?}"),
     }
 }

@@ -16,12 +16,13 @@ use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, MethodKind, MethodSet};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream};
 
 use super::auth::{KbdPrompt, Prompter, SecretStore, passphrase_key, password_key};
 use super::config::HostSpec;
 use super::hostkey::{self, HostKeyStatus};
 use crate::pty::{PtyIo, TermSize};
+use crate::stderr::StderrTail;
 
 /// Where host keys are checked and learned, and how long to wait.
 #[derive(Debug, Clone)]
@@ -627,6 +628,37 @@ impl<P: Prompter> SshSession<P> {
         }
         ch.exec(true, command).await.map_err(chan_err)?;
         Ok(ch)
+    }
+
+    /// Like `open_exec`, but split into a stdout byte stream and a stdin
+    /// writer, with stderr collected into `stderr`.
+    pub async fn open_exec_split(
+        &self,
+        command: &str,
+        env: &[(&str, &str)],
+        stderr: Arc<StderrTail>,
+    ) -> Result<(DuplexStream, Box<dyn AsyncWrite + Send + Unpin>), SshError> {
+        let (mut read, write) = self.open_exec(command, env).await?.split();
+        let writer: Box<dyn AsyncWrite + Send + Unpin> = Box::new(write.make_writer());
+        let (mut stdout, reader) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            // The write half lives as long as the channel is read.
+            let _write = write;
+            while let Some(msg) = read.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => {
+                        if stdout.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    ChannelMsg::ExtendedData { data, .. } => stderr.push(&data),
+                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            stderr.finish();
+        });
+        Ok((reader, writer))
     }
 
     /// Run a command in a PTY of `size` (terminal type `xterm-256color`).

@@ -18,6 +18,7 @@ use crate::link::ProbeIo;
 use crate::ssh::auth::{Prompter, SecretStore};
 use crate::ssh::client::{ConnectOptions, ExecOutput, SshError, connect};
 use crate::ssh::config::{HostSpec, parse_config, resolve};
+use crate::stderr::{StderrTail, collect as collect_stderr};
 
 /// Locale requested for `serve` so zellij output is UTF-8.
 const LOCALE: &str = "en_US.UTF-8";
@@ -219,18 +220,23 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         drop(guard);
         let args = remote.serve_args(&self.client, host.zellij.as_deref());
         let env = [("LANG", LOCALE), ("LC_CTYPE", LOCALE)];
-        let ch = session
-            .open_exec(&remote.invoke(&report.probe_path, &args), &env)
+        let stderr = Arc::new(StderrTail::default());
+        let (r, w) = session
+            .open_exec_split(
+                &remote.invoke(&report.probe_path, &args),
+                &env,
+                stderr.clone(),
+            )
             .await
             .map_err(ssh_open_error)?;
-        let (r, w) = tokio::io::split(ch.into_stream());
         Ok(Opened {
             io: ProbeIo {
                 reader: Box::new(BufReader::new(r)),
-                writer: Box::new(w),
+                writer: w,
             },
             hooks,
             keep: Box::new(session),
+            stderr,
         })
     }
 
@@ -276,14 +282,18 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         cmd.args(serve_argv(&self.client, host.zellij.as_deref()))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = no_window(&mut cmd)
             .spawn()
             .map_err(|e| OpenError::Retry(format!("start {}: {e}", exe.display())))?;
-        let (Some(out), Some(input)) = (child.stdout.take(), child.stdin.take()) else {
+        let (Some(out), Some(input), Some(err)) =
+            (child.stdout.take(), child.stdin.take(), child.stderr.take())
+        else {
             return Err(OpenError::Retry("probe pipes unavailable".into()));
         };
+        let stderr = Arc::new(StderrTail::default());
+        tokio::spawn(collect_stderr(err, stderr.clone()));
         Ok(Opened {
             io: ProbeIo {
                 reader: Box::new(BufReader::new(out)),
@@ -291,6 +301,7 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
             },
             hooks,
             keep: Box::new(child),
+            stderr,
         })
     }
 }

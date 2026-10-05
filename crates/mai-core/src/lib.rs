@@ -8,4 +8,5 @@ pub mod manager;
 pub mod monitor;
 pub mod pty;
 pub mod ssh;
+pub mod stderr;
 pub mod tracker;

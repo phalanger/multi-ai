@@ -16,6 +16,7 @@ use tokio::time::Instant;
 
 use crate::deploy::HookResult;
 use crate::link::{HelloInfo, LinkError, ProbeIo, ProbeLink};
+use crate::stderr::StderrTail;
 
 /// How the app reaches a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +92,16 @@ pub struct Opened {
     pub hooks: Result<Vec<HookResult>, String>,
     /// Kept alive while the probe runs (SSH session, child process).
     pub keep: Box<dyn Any + Send>,
+    /// The probe's stderr, to explain why it stopped.
+    pub stderr: Arc<StderrTail>,
+}
+
+/// `reason`, followed by the end of the probe's stderr if it wrote any.
+async fn with_stderr(reason: String, stderr: &StderrTail) -> String {
+    match stderr.summary().await {
+        Some(tail) => format!("{reason} (probe stderr: {tail})"),
+        None => reason,
+    }
 }
 
 /// Connects to a host, deploys the probe and starts `serve`.
@@ -335,7 +346,7 @@ impl<C: Connector> Host<C> {
                             }
                             continue;
                         }
-                        Err(e) => e.to_string(),
+                        Err(e) => with_stderr(e.to_string(), &opened.stderr).await,
                         Ok(hello) => {
                             self.emit(HostEvent::Hello(hello));
                             self.emit(HostEvent::Hooks(opened.hooks));
@@ -347,7 +358,7 @@ impl<C: Connector> Host<C> {
                             if up_since.elapsed() >= STABLE_AFTER {
                                 backoff.reset();
                             }
-                            e.to_string()
+                            with_stderr(e.to_string(), &opened.stderr).await
                         }
                     }
                 }
