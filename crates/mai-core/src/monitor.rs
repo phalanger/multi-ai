@@ -14,10 +14,13 @@ use crate::tracker::{AgentKey, AgentRecord, Alert, Tracker, TrackerConfig};
 /// A change the UI should show.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Update {
+    /// A connection of the host changed. `term` is `None` while no
+    /// terminal is open.
     Host {
         id: String,
         state: HostState,
         probe: ConnState,
+        term: Option<ConnState>,
     },
     Hello {
         id: String,
@@ -60,6 +63,8 @@ pub enum Update {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HostView {
     pub probe: Option<ConnState>,
+    /// Terminal connection; `None` while no terminal is open.
+    pub term: Option<ConnState>,
     pub hello: Option<HelloInfo>,
     pub sessions: Vec<SessionInfo>,
     pub panes: BTreeMap<String, Vec<PaneInfo>>,
@@ -100,17 +105,29 @@ impl Monitor {
         self.hosts.remove(id);
     }
 
+    /// Host state from both connections; a probe connection not reported
+    /// yet counts as connecting.
+    fn host_update(id: String, view: &HostView) -> Update {
+        let probe = view.probe.clone().unwrap_or(ConnState::Connecting);
+        Update::Host {
+            state: host_state(&probe, view.term.as_ref()),
+            id,
+            probe,
+            term: view.term.clone(),
+        }
+    }
+
     pub fn apply(&mut self, id: &str, ev: HostEvent, now_ms: u64) -> Vec<Update> {
         let id = id.to_owned();
         let view = self.hosts.entry(id.clone()).or_default();
         match ev {
             HostEvent::Probe(probe) => {
-                view.probe = Some(probe.clone());
-                vec![Update::Host {
-                    state: host_state(&probe, None),
-                    id,
-                    probe,
-                }]
+                view.probe = Some(probe);
+                vec![Self::host_update(id, view)]
+            }
+            HostEvent::Term(term) => {
+                view.term = term;
+                vec![Self::host_update(id, view)]
             }
             HostEvent::Hello(info) => {
                 view.hello = Some(info.clone());

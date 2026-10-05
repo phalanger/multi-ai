@@ -75,7 +75,8 @@ fn connection_state_becomes_host_state() {
         vec![Update::Host {
             id: "h".into(),
             state: HostState::Online,
-            probe: ConnState::Up
+            probe: ConnState::Up,
+            term: None,
         }]
     );
     let auth = ConnState::NeedsUser(Problem::Auth("denied".into()));
@@ -88,6 +89,44 @@ fn connection_state_becomes_host_state() {
         }
     ));
     assert_eq!(m.host("h").unwrap().probe, Some(auth));
+}
+
+#[test]
+fn terminal_connection_joins_the_host_state() {
+    let mut m = monitor();
+    m.apply("h", HostEvent::Probe(ConnState::Up), 0);
+    let down = ConnState::Retrying {
+        retry_in: std::time::Duration::from_secs(1),
+        reason: "lost".into(),
+    };
+    let out = m.apply("h", HostEvent::Term(Some(down.clone())), 0);
+    assert_eq!(
+        out,
+        vec![Update::Host {
+            id: "h".into(),
+            state: HostState::Degraded,
+            probe: ConnState::Up,
+            term: Some(down),
+        }]
+    );
+    let out = m.apply("h", HostEvent::Term(Some(ConnState::Up)), 0);
+    assert!(matches!(
+        &out[0],
+        Update::Host {
+            state: HostState::Online,
+            ..
+        }
+    ));
+    let out = m.apply("h", HostEvent::Term(None), 0);
+    assert!(matches!(
+        &out[0],
+        Update::Host {
+            state: HostState::Online,
+            term: None,
+            ..
+        }
+    ));
+    assert_eq!(m.host("h").unwrap().term, None);
 }
 
 #[test]

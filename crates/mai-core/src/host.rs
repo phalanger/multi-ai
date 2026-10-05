@@ -17,6 +17,7 @@ use tokio::time::Instant;
 use crate::deploy::HookResult;
 use crate::link::{HelloInfo, LinkError, ProbeIo, ProbeLink};
 use crate::stderr::StderrTail;
+use crate::term::TermTransport;
 
 /// How the app reaches a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,9 +105,17 @@ async fn with_stderr(reason: String, stderr: &StderrTail) -> String {
     }
 }
 
-/// Connects to a host, deploys the probe and starts `serve`.
+/// Reaches hosts: the probe connection (`open`: connect, deploy, start
+/// `serve`) and the terminal connection (`open_terminals`).
 pub trait Connector: Send + Sync + 'static {
+    type Terminals: TermTransport;
+
     fn open(&self, host: &HostConfig) -> impl Future<Output = Result<Opened, OpenError>> + Send;
+
+    fn open_terminals(
+        &self,
+        host: &HostConfig,
+    ) -> impl Future<Output = Result<Self::Terminals, OpenError>> + Send;
 }
 
 /// State of one connection of a host.
@@ -202,6 +211,8 @@ pub enum HostEvent {
     Msg(ProbeMsg),
     /// A command could not be delivered (probe not connected).
     Dropped(AppMsg),
+    /// Terminal connection state; `None` while no terminal is open.
+    Term(Option<ConnState>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

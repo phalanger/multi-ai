@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use tokio::io::BufReader;
 
 use crate::deploy::{
-    DeployError, DeployOptions, HookResult, ProbeStore, Remote, Shell, deploy, hooks_result,
-    normalize_arch, serve_argv, sha256_hex, stop_argv,
+    DeployError, DeployOptions, HookResult, ProbeStore, Remote, Shell, deploy, detect,
+    hooks_result, normalize_arch, serve_argv, sha256_hex, stop_argv,
 };
 use crate::host::{Connector, HostConfig, HostKind, OpenError, Opened, Problem};
 use crate::link::ProbeIo;
@@ -19,6 +19,7 @@ use crate::ssh::auth::{Prompter, SecretStore};
 use crate::ssh::client::{ConnectOptions, ExecOutput, SshError, connect};
 use crate::ssh::config::{HostSpec, parse_config, resolve};
 use crate::stderr::{StderrTail, collect as collect_stderr};
+use crate::terminals::SystemTerminals;
 
 /// Locale requested for `serve` so zellij output is UTF-8.
 const LOCALE: &str = "en_US.UTF-8";
@@ -306,11 +307,40 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
     }
 }
 
+impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
+    /// A second SSH session for terminals. Connecting holds the host's
+    /// gate, so it never prompts for a host key at the same time as the
+    /// probe connection.
+    async fn open_ssh_terminals(
+        &self,
+        host: &HostConfig,
+        target: &str,
+    ) -> Result<SystemTerminals<P>, OpenError> {
+        let spec = self.spec(target)?;
+        let gate = self.gate(&host.id);
+        let _guard = gate.lock().await;
+        let session = connect(&spec, &self.opts, self.prompter.clone(), &*self.secrets)
+            .await
+            .map_err(ssh_open_error)?;
+        let remote = detect(&session).await.map_err(deploy_open_error)?;
+        Ok(SystemTerminals::Ssh { session, remote })
+    }
+}
+
 impl<P: Prompter, S: SecretStore> Connector for SystemConnector<P, S> {
+    type Terminals = SystemTerminals<P>;
+
     async fn open(&self, host: &HostConfig) -> Result<Opened, OpenError> {
         match &host.kind {
             HostKind::Local => self.open_local(host).await,
             HostKind::Ssh { target } => self.open_ssh(host, target).await,
+        }
+    }
+
+    async fn open_terminals(&self, host: &HostConfig) -> Result<SystemTerminals<P>, OpenError> {
+        match &host.kind {
+            HostKind::Local => Ok(SystemTerminals::Local),
+            HostKind::Ssh { target } => self.open_ssh_terminals(host, target).await,
         }
     }
 }

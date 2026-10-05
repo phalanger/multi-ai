@@ -14,7 +14,9 @@ use mai_core::host::{
 use mai_core::link::ProbeIo;
 use mai_core::manager::HostManager;
 use mai_core::monitor::Update;
+use mai_core::pty::{PtyEnds, PtyIn, PtyIo, TermSize, pty_channels};
 use mai_core::stderr::StderrTail;
+use mai_core::term::{AttachSpec, TermError, TermEvent, TermTransport};
 use mai_core::tracker::{AgentKey, TrackerConfig};
 use mai_protocol::{
     AgentEvent, AgentState, AppMsg, EventSource, PROTOCOL_VERSION, PaneRef, ProbeMsg, decode_line,
@@ -38,12 +40,16 @@ impl FakeProbe {
     }
 
     async fn hello(&mut self, version: u32) {
+        self.hello_with(version, None).await;
+    }
+
+    async fn hello_with(&mut self, version: u32, zellij: Option<&str>) {
         self.send(&ProbeMsg::Hello {
             protocol_version: version,
             probe_version: "0.1.0".into(),
             os: "linux".into(),
             arch: "x86_64".into(),
-            zellij_path: None,
+            zellij_path: zellij.map(str::to_owned),
             zellij_version: None,
         })
         .await;
@@ -64,11 +70,42 @@ enum Step {
     Probe,
 }
 
+/// One terminal attach: the zellij binary used, what was attached, and
+/// the PTY ends to drive it.
+struct Attach {
+    zellij: Option<String>,
+    spec: AttachSpec,
+    ends: PtyEnds,
+}
+
+/// Terminal connection of `Scripted`: every attach succeeds.
+struct ScriptedTerms {
+    attaches: UnboundedSender<Attach>,
+}
+
+impl TermTransport for ScriptedTerms {
+    async fn attach(
+        &mut self,
+        zellij: Option<&str>,
+        spec: &AttachSpec,
+    ) -> Result<PtyIo, OpenError> {
+        let (io, ends) = pty_channels();
+        let _ = self.attaches.send(Attach {
+            zellij: zellij.map(str::to_owned),
+            spec: spec.clone(),
+            ends,
+        });
+        Ok(io)
+    }
+}
+
 /// Replays `steps` in order; hangs once they run out.
 struct Scripted {
     steps: Mutex<VecDeque<Step>>,
     opens: AtomicUsize,
     probes: UnboundedSender<FakeProbe>,
+    attaches: UnboundedSender<Attach>,
+    attaches_rx: Mutex<Option<UnboundedReceiver<Attach>>>,
     /// Stderr of every probe this connector starts.
     stderr: Arc<StderrTail>,
 }
@@ -76,10 +113,13 @@ struct Scripted {
 impl Scripted {
     fn new(steps: Vec<Step>) -> (Arc<Self>, UnboundedReceiver<FakeProbe>) {
         let (probes, rx) = mpsc::unbounded_channel();
+        let (attaches, attaches_rx) = mpsc::unbounded_channel();
         let c = Self {
             steps: Mutex::new(steps.into()),
             opens: AtomicUsize::new(0),
             probes,
+            attaches,
+            attaches_rx: Mutex::new(Some(attaches_rx)),
             stderr: Arc::default(),
         };
         (Arc::new(c), rx)
@@ -88,9 +128,22 @@ impl Scripted {
     fn opens(&self) -> usize {
         self.opens.load(Ordering::SeqCst)
     }
+
+    /// Terminal attaches made through this connector.
+    fn attaches(&self) -> UnboundedReceiver<Attach> {
+        self.attaches_rx.lock().unwrap().take().expect("taken once")
+    }
 }
 
 impl Connector for Scripted {
+    type Terminals = ScriptedTerms;
+
+    async fn open_terminals(&self, _host: &HostConfig) -> Result<ScriptedTerms, OpenError> {
+        Ok(ScriptedTerms {
+            attaches: self.attaches.clone(),
+        })
+    }
+
     async fn open(&self, _host: &HostConfig) -> Result<Opened, OpenError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
         let step = self.steps.lock().unwrap().pop_front();
@@ -485,6 +538,59 @@ async fn dropping_the_manager_ends_the_update_stream() {
             Err(_) => panic!("update stream did not end"),
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn terminal_uses_the_probe_zellij_and_joins_the_host_state() {
+    let (c, mut probes) = Scripted::new(vec![Step::Probe]);
+    let mut attaches = c.attaches();
+    let (mut mgr, mut rx) = HostManager::start(c, TrackerConfig::default());
+    mgr.add_host(cfg("h"));
+    let size = TermSize { cols: 80, rows: 24 };
+    assert_eq!(
+        mgr.open_terminal("nope", "w", false, size).await.err(),
+        Some(TermError::NoHost)
+    );
+
+    let mut probe = probes.recv().await.unwrap();
+    probe
+        .hello_with(PROTOCOL_VERSION, Some("/usr/bin/zellij"))
+        .await;
+    until(&mut rx, |u| match u {
+        Update::Hello { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let mut term = mgr.open_terminal("h", "work", false, size).await.unwrap();
+    assert_eq!(term.recv().await, Some(TermEvent::Attached));
+    let mut pty = attaches.recv().await.unwrap();
+    assert_eq!(pty.zellij.as_deref(), Some("/usr/bin/zellij"));
+    assert_eq!(pty.spec.session, "work");
+    let term_up = until(&mut rx, |u| match u {
+        Update::Host {
+            term: Some(t),
+            state,
+            ..
+        } => Some((t.clone(), *state)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(term_up, (ConnState::Up, HostState::Online));
+
+    term.write(b"q".to_vec());
+    assert_eq!(
+        pty.ends.input.recv().await,
+        Some(PtyIn::Data(b"q".to_vec()))
+    );
+    drop(term);
+    assert_eq!(pty.ends.input.recv().await, Some(PtyIn::Close));
+    // The last terminal is gone: the terminal connection is closed.
+    until(&mut rx, |u| match u {
+        Update::Host { term: None, .. } => Some(()),
+        _ => None,
+    })
+    .await;
 }
 
 #[tokio::test(start_paused = true)]
