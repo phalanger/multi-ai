@@ -6,7 +6,7 @@
 //! keyboard-interactive. Methods the server does not offer are skipped.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,13 +14,14 @@ use std::time::Duration;
 use russh::client::{self, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
-use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::keys::{PrivateKeyWithHashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{ChannelMsg, MethodKind, MethodSet};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream};
 
-use super::auth::{KbdPrompt, Prompter, SecretStore, passphrase_key, password_key};
+use super::auth::{KbdPrompt, Prompter, SecretStore, password_key};
 use super::config::HostSpec;
 use super::hostkey::{self, HostKeyStatus};
+use super::signer::{FileSigner, load_key, public_key_of};
 use crate::pty::{PtyIo, TermSize};
 use crate::stderr::StderrTail;
 
@@ -273,6 +274,7 @@ impl ExecOutput {
 pub struct SshSession<P: Prompter> {
     handle: Handle<Checker<P>>,
     _via: Option<Box<SshSession<P>>>,
+    notes: Vec<String>,
 }
 
 fn client_config() -> Arc<client::Config> {
@@ -375,10 +377,12 @@ async fn connect_hop<P: Prompter, S: SecretStore>(
         }
         Ok(h) => h,
     };
-    authenticate(&mut handle, hop, prompter.as_ref(), secrets).await?;
+    let mut notes = via.as_ref().map(|v| v.notes.clone()).unwrap_or_default();
+    authenticate(&mut handle, hop, prompter.as_ref(), secrets, &mut notes).await?;
     Ok(SshSession {
         handle,
         _via: via.map(Box::new),
+        notes,
     })
 }
 
@@ -419,6 +423,7 @@ async fn authenticate<P: Prompter, S: SecretStore>(
     spec: &HostSpec,
     prompter: &P,
     secrets: &S,
+    notes: &mut Vec<String>,
 ) -> Result<(), SshError> {
     let user = spec.user.as_str();
     let mut methods = match h.authenticate_none(user).await.map_err(connect_err)? {
@@ -431,27 +436,54 @@ async fn authenticate<P: Prompter, S: SecretStore>(
         if !offers(&methods, MethodKind::PublicKey) {
             break 'keys;
         }
+        // Public keys already offered, so the agent does not offer them
+        // again (each attempt counts against MaxAuthTries).
+        let mut tried: Vec<PublicKey> = Vec::new();
         for path in spec.identity_files.iter().filter(|p| p.is_file()) {
-            let Some(key) = load_key(path, prompter, secrets).await else {
-                continue;
-            };
             let hash = h
                 .best_supported_rsa_hash()
                 .await
                 .map_err(connect_err)?
                 .flatten();
-            let r = h
-                .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
-                .await
-                .map_err(connect_err)?;
+            let r = match public_key_of(path) {
+                // Offer the public key; the passphrase is asked only if the
+                // server accepts it.
+                Some(public) => {
+                    tried.push(public.clone());
+                    let mut signer = FileSigner {
+                        path,
+                        prompter,
+                        secrets,
+                        notes,
+                    };
+                    match h
+                        .authenticate_publickey_with(user, public, hash, &mut signer)
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => return Err(SshError::Connect("connection lost".into())),
+                    }
+                }
+                // Formats without a readable public key: decrypt first.
+                None => {
+                    let Some(key) = load_key(path, prompter, secrets, notes).await else {
+                        continue;
+                    };
+                    tried.push(key.public_key().clone());
+                    h.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+                        .await
+                        .map_err(connect_err)?
+                }
+            };
             match step(&mut methods, &r) {
                 Step::Done => return Ok(()),
                 Step::Partial => break 'keys,
                 Step::Failed => {}
             }
         }
-        if try_agent(h, user).await? {
-            return Ok(());
+        match try_agent(h, user, &tried, &mut methods).await? {
+            Step::Done => return Ok(()),
+            Step::Partial | Step::Failed => {}
         }
     }
 
@@ -467,7 +499,12 @@ async fn authenticate<P: Prompter, S: SecretStore>(
                 Step::Done => return Ok(()),
                 Step::Partial => accepted = true,
                 Step::Failed => {
-                    let _ = secrets.delete(&key);
+                    if let Err(e) = secrets.delete(&key) {
+                        notes.push(format!(
+                            "could not remove the wrong password of {} from the keychain: {e}",
+                            spec.alias
+                        ));
+                    }
                 }
             }
         }
@@ -480,8 +517,14 @@ async fn authenticate<P: Prompter, S: SecretStore>(
                 .await
                 .map_err(connect_err)?;
             let result = step(&mut methods, &r);
-            if result != Step::Failed && s.remember {
-                let _ = secrets.set(&key, &s.value);
+            if result != Step::Failed
+                && s.remember
+                && let Err(e) = secrets.set(&key, &s.value)
+            {
+                notes.push(format!(
+                    "could not save the password of {} in the keychain: {e}",
+                    spec.alias
+                ));
             }
             if result == Step::Done {
                 return Ok(());
@@ -500,47 +543,28 @@ async fn authenticate<P: Prompter, S: SecretStore>(
     )))
 }
 
-/// Load a private key; ask for (and optionally remember) its passphrase.
-async fn load_key<P: Prompter, S: SecretStore>(
-    path: &Path,
-    prompter: &P,
-    secrets: &S,
-) -> Option<PrivateKey> {
-    match russh::keys::load_secret_key(path, None) {
-        Ok(k) => return Some(k),
-        Err(russh::keys::Error::KeyIsEncrypted) => {}
-        Err(_) => return None,
-    }
-    let key = passphrase_key(path);
-    if let Some(pass) = secrets.get(&key) {
-        if let Ok(k) = russh::keys::load_secret_key(path, Some(&pass)) {
-            return Some(k);
-        }
-        let _ = secrets.delete(&key);
-    }
-    let s = prompter.passphrase(path).await?;
-    let k = russh::keys::load_secret_key(path, Some(&s.value)).ok()?;
-    if s.remember {
-        let _ = secrets.set(&key, &s.value);
-    }
-    Some(k)
-}
-
+/// Offer the agent's keys that were not tried already. Partial success
+/// (the server wants another factor) stops here like a key file does.
 async fn agent_auth<P: Prompter, A>(
     h: &mut Handle<Checker<P>>,
     user: &str,
     mut agent: AgentClient<A>,
-) -> Result<bool, SshError>
+    tried: &[PublicKey],
+    methods: &mut Option<MethodSet>,
+) -> Result<Step, SshError>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Ok(ids) = agent.request_identities().await else {
-        return Ok(false);
+        return Ok(Step::Failed);
     };
     for id in ids {
         let AgentIdentity::PublicKey { key, .. } = id else {
             continue;
         };
+        if tried.iter().any(|t| t.key_data() == key.key_data()) {
+            continue;
+        }
         let hash = h
             .best_supported_rsa_hash()
             .await
@@ -549,34 +573,51 @@ where
         if let Ok(r) = h
             .authenticate_publickey_with(user, key, hash, &mut agent)
             .await
-            && r.success()
         {
-            return Ok(true);
+            match step(methods, &r) {
+                Step::Failed => {}
+                done_or_partial => return Ok(done_or_partial),
+            }
         }
     }
-    Ok(false)
+    Ok(Step::Failed)
 }
 
 #[cfg(unix)]
-async fn try_agent<P: Prompter>(h: &mut Handle<Checker<P>>, user: &str) -> Result<bool, SshError> {
+async fn try_agent<P: Prompter>(
+    h: &mut Handle<Checker<P>>,
+    user: &str,
+    tried: &[PublicKey],
+    methods: &mut Option<MethodSet>,
+) -> Result<Step, SshError> {
     match AgentClient::connect_env().await {
-        Ok(agent) => agent_auth(h, user, agent).await,
-        Err(_) => Ok(false),
+        Ok(agent) => agent_auth(h, user, agent, tried, methods).await,
+        Err(_) => Ok(Step::Failed),
     }
 }
 
 #[cfg(windows)]
-async fn try_agent<P: Prompter>(h: &mut Handle<Checker<P>>, user: &str) -> Result<bool, SshError> {
-    if let Ok(agent) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await
-        && agent_auth(h, user, agent).await?
-    {
-        return Ok(true);
+async fn try_agent<P: Prompter>(
+    h: &mut Handle<Checker<P>>,
+    user: &str,
+    tried: &[PublicKey],
+    methods: &mut Option<MethodSet>,
+) -> Result<Step, SshError> {
+    if let Ok(agent) = AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+        let r = agent_auth(h, user, agent, tried, methods).await?;
+        if r != Step::Failed {
+            return Ok(r);
+        }
     }
     match AgentClient::connect_pageant().await {
-        Ok(agent) => agent_auth(h, user, agent).await,
-        Err(_) => Ok(false),
+        Ok(agent) => agent_auth(h, user, agent, tried, methods).await,
+        Err(_) => Ok(Step::Failed),
     }
 }
+
+/// A server that keeps asking keyboard-interactive questions is given up
+/// on after this many rounds.
+pub const MAX_KBD_ROUNDS: usize = 10;
 
 async fn keyboard_interactive<P: Prompter>(
     h: &mut Handle<Checker<P>>,
@@ -587,7 +628,7 @@ async fn keyboard_interactive<P: Prompter>(
         .authenticate_keyboard_interactive_start(spec.user.clone(), None)
         .await
         .map_err(connect_err)?;
-    loop {
+    for _ in 0..MAX_KBD_ROUNDS {
         match reply {
             KeyboardInteractiveAuthResponse::Success => return Ok(true),
             KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
@@ -621,9 +662,16 @@ async fn keyboard_interactive<P: Prompter>(
             }
         }
     }
+    Ok(matches!(reply, KeyboardInteractiveAuthResponse::Success))
 }
 
 impl<P: Prompter> SshSession<P> {
+    /// Things the user should know that did not stop the connection, from
+    /// every hop (e.g. a password that could not be saved in the keychain).
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
     /// Run `command` to completion, collecting stdout, stderr and status.
     pub async fn exec(&self, command: &str) -> Result<ExecOutput, SshError> {
         let mut ch = self.handle.channel_open_session().await.map_err(chan_err)?;

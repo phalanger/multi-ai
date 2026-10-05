@@ -69,9 +69,21 @@ pub fn password_key(host_id: &str) -> String {
     format!("{host_id}/password")
 }
 
-/// Store key for a private key's passphrase (`passphrase:<path>`).
+/// Store key for a private key's passphrase (`passphrase:<path>`). The
+/// path is made canonical when the file exists, so different spellings of
+/// the same file (relative, `..`, symlinks; on Windows also letter case
+/// and `/` vs `\`) share one entry.
 pub fn passphrase_key(key_file: &Path) -> String {
-    format!("passphrase:{}", key_file.display())
+    let path = std::fs::canonicalize(key_file).unwrap_or_else(|_| key_file.to_path_buf());
+    let mut text = path.display().to_string();
+    if cfg!(windows) {
+        // canonicalize returns a verbatim `\\?\C:\...` path.
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            text = rest.to_owned();
+        }
+        text = text.to_lowercase();
+    }
+    format!("passphrase:{text}")
 }
 
 const KEYRING_SERVICE: &str = "multi-ai";

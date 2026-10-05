@@ -6,3 +6,4 @@ pub mod client;
 pub mod config;
 pub mod hostkey;
 mod pty;
+pub mod signer;

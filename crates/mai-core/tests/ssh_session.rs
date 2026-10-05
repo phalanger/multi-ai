@@ -55,6 +55,15 @@ impl server::Handler for TestServer {
         })
     }
 
+    /// Like OpenSSH: only an authorized key gets `PK_OK` for a probe.
+    async fn auth_publickey_offered(
+        &mut self,
+        user: &str,
+        key: &PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        self.auth_publickey(user, key).await
+    }
+
     async fn auth_publickey(&mut self, _user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
         let ok = self
             .0
@@ -80,6 +89,14 @@ impl server::Handler for TestServer {
         let answer = response
             .next()
             .map(|b| String::from_utf8_lossy(&b).into_owned());
+        // "again" makes the server ask another round, forever.
+        if answer.as_deref() == Some("again") {
+            return Ok(Auth::Partial {
+                name: "otp".into(),
+                instructions: "enter code".into(),
+                prompts: vec![("Code: ".into(), false)].into(),
+            });
+        }
         Ok(if answer.as_deref() == Some(OTP) {
             Auth::Accept
         } else {
@@ -94,6 +111,28 @@ impl server::Handler for TestServer {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         reply.accept().await;
+        Ok(())
+    }
+
+    /// Forward a `direct-tcpip` channel to a local TCP port (a jump host).
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host: &str,
+        port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: server::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let addr = format!("{host}:{port}");
+        reply.accept().await;
+        tokio::spawn(async move {
+            if let Ok(mut tcp) = tokio::net::TcpStream::connect(addr).await {
+                let mut stream = channel.into_stream();
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+            }
+        });
         Ok(())
     }
 
@@ -611,3 +650,196 @@ async fn timed_out_connection_never_prompts_later() {
     assert!(p.calls().is_empty(), "{:?}", p.calls());
     assert!(!dir.path().join("known_hosts").exists());
 }
+
+#[tokio::test]
+async fn rejected_encrypted_key_is_never_decrypted() {
+    let accepted = random_key();
+    let rejected = random_key();
+    let (port, _) = start(ServerCfg {
+        methods: vec![MethodKind::PublicKey],
+        client_key: Some(accepted.public_key().clone()),
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let write = |k: &PrivateKey, name: &str| {
+        let f = dir.path().join(name);
+        k.encrypt(&mut SysRng, "pw")
+            .unwrap()
+            .write_openssh_file(&f, LineEnding::LF)
+            .unwrap();
+        f
+    };
+    let files = vec![write(&rejected, "id_other"), write(&accepted, "id_ok")];
+    let p = Arc::new(Scripted {
+        trust: true,
+        passphrase: secret("pw", false),
+        ..Default::default()
+    });
+    connect(
+        &spec(port, files),
+        &opts(dir.path()),
+        p.clone(),
+        &MemStore::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        p.calls(),
+        vec!["host_key", "passphrase"],
+        "only the accepted key"
+    );
+}
+
+#[tokio::test]
+async fn refused_passphrase_moves_on_to_password() {
+    let client = random_key();
+    let (port, _) = start(ServerCfg {
+        methods: vec![MethodKind::PublicKey, MethodKind::Password],
+        client_key: Some(client.public_key().clone()),
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("id_enc");
+    client
+        .encrypt(&mut SysRng, "pw")
+        .unwrap()
+        .write_openssh_file(&key_file, LineEnding::LF)
+        .unwrap();
+    let p = Arc::new(Scripted {
+        trust: true,
+        passphrase: None,
+        password: secret(PASSWORD, false),
+        ..Default::default()
+    });
+    connect(
+        &spec(port, vec![key_file]),
+        &opts(dir.path()),
+        p.clone(),
+        &MemStore::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p.calls(), vec!["host_key", "passphrase", "password"]);
+}
+
+#[tokio::test]
+async fn endless_keyboard_interactive_gives_up() {
+    let (port, _) = start(ServerCfg {
+        methods: vec![MethodKind::KeyboardInteractive],
+        client_key: None,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = Arc::new(Scripted {
+        trust: true,
+        kbd: Some(vec!["again".into()]),
+        ..Default::default()
+    });
+    let err = connect(
+        &spec(port, vec![]),
+        &opts(dir.path()),
+        p.clone(),
+        &MemStore::default(),
+    )
+    .await
+    .err()
+    .expect("auth fails");
+    assert!(matches!(err, SshError::Auth(_)), "{err:?}");
+    let rounds = p.calls().iter().filter(|c| c.starts_with("kbd")).count();
+    assert_eq!(rounds, mai_core::ssh::client::MAX_KBD_ROUNDS);
+}
+
+/// A keychain that refuses every write.
+struct ReadOnlyStore;
+
+impl SecretStore for ReadOnlyStore {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+    fn set(&self, _key: &str, _value: &str) -> Result<(), String> {
+        Err("keychain locked".into())
+    }
+    fn delete(&self, _key: &str) -> Result<(), String> {
+        Err("keychain locked".into())
+    }
+}
+
+#[tokio::test]
+async fn keychain_failure_is_reported_not_swallowed() {
+    let (port, _) = start(ServerCfg {
+        methods: vec![MethodKind::Password],
+        client_key: None,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = Arc::new(Scripted {
+        trust: true,
+        password: secret(PASSWORD, true),
+        ..Default::default()
+    });
+    let s = connect(&spec(port, vec![]), &opts(dir.path()), p, &ReadOnlyStore)
+        .await
+        .unwrap();
+    assert_eq!(s.notes().len(), 1, "{:?}", s.notes());
+    assert!(
+        s.notes()[0].contains("could not save the password"),
+        "{:?}",
+        s.notes()
+    );
+    assert!(s.notes()[0].contains("keychain locked"), "{:?}", s.notes());
+}
+
+#[test]
+fn passphrase_key_is_the_same_for_every_spelling_of_a_path() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let file = dir.path().join("id_key");
+    std::fs::write(&file, "x").unwrap();
+    let detour = dir.path().join("sub").join("..").join("id_key");
+    assert_eq!(passphrase_key(&file), passphrase_key(&detour));
+    if cfg!(windows) {
+        let upper = PathBuf::from(file.to_string_lossy().to_uppercase());
+        assert_eq!(passphrase_key(&file), passphrase_key(&upper));
+    }
+    let missing = dir.path().join("nope");
+    assert!(passphrase_key(&missing).starts_with("passphrase:"));
+}
+
+#[tokio::test]
+async fn connects_through_a_jump_host() {
+    let (jump_port, _) = start(ServerCfg {
+        methods: vec![MethodKind::Password],
+        client_key: None,
+    })
+    .await;
+    let (target_port, _) = start(ServerCfg {
+        methods: vec![MethodKind::Password],
+        client_key: None,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = Arc::new(Scripted {
+        trust: true,
+        password: secret(PASSWORD, false),
+        ..Default::default()
+    });
+    let mut target = spec(target_port, vec![]);
+    target.jumps = vec![HostSpec {
+        alias: "jump".into(),
+        ..spec(jump_port, vec![])
+    }];
+    let s = connect(&target, &opts(dir.path()), p.clone(), &MemStore::default())
+        .await
+        .unwrap();
+    let out = s.exec("hello").await.unwrap();
+    assert_eq!(out.stdout_str(), "hello");
+    // Both hops verified their host key and logged in.
+    assert_eq!(
+        p.calls(),
+        vec!["host_key", "password", "host_key", "password"]
+    );
+    let learned = std::fs::read_to_string(dir.path().join("known_hosts")).unwrap();
+    assert_eq!(learned.lines().count(), 2, "{learned}");
+}
+
+use std::future::Future;
