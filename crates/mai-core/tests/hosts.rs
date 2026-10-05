@@ -614,3 +614,21 @@ async fn probe_stderr_explains_why_it_stopped() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn dropping_the_manager_ends_open_terminals() {
+    let (c, _probes) = Scripted::new(vec![]);
+    let mut attaches = c.attaches();
+    let (mut mgr, _rx) = HostManager::start(c, TrackerConfig::default());
+    mgr.add_host(cfg("h"));
+    let size = TermSize { cols: 80, rows: 24 };
+    let mut term = mgr.open_terminal("h", "work", false, size).await.unwrap();
+    assert_eq!(term.recv().await, Some(TermEvent::Attached));
+    let mut pty = attaches.recv().await.unwrap();
+    drop(mgr);
+    assert_eq!(pty.ends.input.recv().await, Some(PtyIn::Close));
+    let end = timeout(Duration::from_secs(60), term.recv())
+        .await
+        .expect("terminal stream ended");
+    assert_eq!(end, None);
+}

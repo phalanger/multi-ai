@@ -357,3 +357,26 @@ async fn reconnect_needing_the_user_waits_for_retry() {
     assert_eq!(h.state().await, Some(ConnState::Up));
     h.attached().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn opening_a_terminal_while_detached_reattaches_the_others() {
+    let mut h = start(None, vec![]);
+    let (_id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    let first = h.attached().await;
+    assert_eq!(next(&mut rx).await, Some(TermEvent::Attached));
+
+    drop(first.ends.output);
+    assert!(matches!(
+        next(&mut rx).await,
+        Some(TermEvent::Detached { .. })
+    ));
+    // Before the backoff fires: opening reconnects and reattaches all.
+    let (_id2, _rx2) = h.open("logs").await.unwrap();
+    assert_eq!(next(&mut rx).await, Some(TermEvent::Attached));
+    let a = h.attached().await;
+    let b = h.attached().await;
+    let mut sessions = vec![a.spec.session, b.spec.session];
+    sessions.sort();
+    assert_eq!(sessions, vec!["logs", "work"]);
+}

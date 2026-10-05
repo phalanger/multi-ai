@@ -252,3 +252,14 @@ impl<C: Connector> HostManager<C> {
         ids
     }
 }
+
+impl<C> Drop for HostManager<C> {
+    /// Stops every host's tasks. Open terminals hold a sender of their
+    /// terminal task, so closing the channels alone would not end it.
+    fn drop(&mut self) {
+        for tasks in self.hosts.values() {
+            let _ = tasks.probe.send(HostCommand::Stop);
+            let _ = tasks.term.send(TermCmd::Stop);
+        }
+    }
+}

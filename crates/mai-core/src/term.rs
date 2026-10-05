@@ -229,13 +229,20 @@ impl<C: Connector> Terms<C> {
     }
 
     async fn open(&mut self, spec: AttachSpec) -> OpenResult {
-        if !matches!(self.link, Link::Up(_))
+        if matches!(self.link, Link::Down(_)) {
+            // Detached terminals exist: reconnect and reattach them all, or
+            // they would stay detached once the link is up again.
+            self.reconnect().await;
+            if !matches!(self.link, Link::Up(_)) {
+                return Err(TermError::Open(OpenError::Retry(
+                    "terminal connection is down".into(),
+                )));
+            }
+        } else if matches!(self.link, Link::Idle)
             && let Err(e) = self.connect().await
         {
-            if self.slots.is_empty() {
-                self.link = Link::Idle;
-                self.emit(None);
-            }
+            self.link = Link::Idle;
+            self.emit(None);
             return Err(TermError::Open(e));
         }
         let id = self.next_id;
