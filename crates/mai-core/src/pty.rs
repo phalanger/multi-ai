@@ -7,6 +7,8 @@
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::thread;
 
@@ -103,6 +105,9 @@ pub fn spawn_local(
     let mut killer = child.clone_killer();
     let mut reader_killer = child.clone_killer();
     let master = pair.master;
+    let exited = Arc::new(AtomicBool::new(false));
+    let exited_in = Arc::clone(&exited);
+    let exited_rd = Arc::clone(&exited);
     let (io, ends) = pty_channels();
     let PtyEnds {
         input: mut in_rx,
@@ -127,18 +132,22 @@ pub fn spawn_local(
                 PtyIn::Close => break,
             }
         }
-        let _ = killer.kill();
+        if !exited_in.load(Ordering::SeqCst) {
+            let _ = killer.kill();
+        }
         drop(writer);
         drop(master);
     });
 
     // Waiter thread: the exit status, then wake the input thread so it
-    // drops the master (killing an exited program is harmless). The sender
-    // is weak so it does not keep the input thread alive once the app drops
-    // its own.
+    // drops the master. It sets `exited` first, and nothing kills the
+    // program after that, because on Unix a kill signals a raw pid that may
+    // have been reused once the child is reaped. The sender is weak so it
+    // does not keep the input thread alive once the app drops its own.
     let wake = io.input.downgrade();
     let waiter = thread::spawn(move || {
         let status = child.wait().ok().map(|s| s.exit_code());
+        exited.store(true, Ordering::SeqCst);
         if let Some(tx) = wake.upgrade() {
             let _ = tx.send(PtyIn::Close);
         }
@@ -154,7 +163,9 @@ pub fn spawn_local(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if out_tx.send(PtyOut::Data(buf[..n].to_vec())).is_err() {
-                        let _ = reader_killer.kill();
+                        if !exited_rd.load(Ordering::SeqCst) {
+                            let _ = reader_killer.kill();
+                        }
                         break;
                     }
                 }
