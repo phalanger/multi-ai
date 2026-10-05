@@ -9,6 +9,7 @@ pub mod monitor;
 pub mod pty;
 pub mod ssh;
 pub mod stderr;
+pub mod swap;
 pub mod term;
 pub mod terminals;
 pub mod tracker;

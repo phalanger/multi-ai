@@ -3,6 +3,7 @@
 //! copied into the home directory and `serve` started as a child process.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,7 @@ use crate::ssh::auth::{Prompter, SecretStore};
 use crate::ssh::client::{ConnectOptions, ExecOutput, SshError, connect};
 use crate::ssh::config::{HostSpec, parse_config, resolve};
 use crate::stderr::{StderrTail, collect as collect_stderr};
+use crate::swap::{LocalFiles, swap_in};
 use crate::terminals::SystemTerminals;
 
 /// Locale requested for `serve` so zellij output is UTF-8.
@@ -74,30 +76,44 @@ pub fn local_remote(home: &Path) -> Option<Remote> {
 }
 
 /// Put `bytes` at `exe` unless it already has them. `stop` runs first
-/// when an existing, different binary is replaced (a running probe locks
-/// its file on Windows). Returns whether the file was written.
-pub fn place_binary(exe: &Path, bytes: &[u8], stop: impl FnOnce()) -> std::io::Result<bool> {
-    let existing = std::fs::read(exe).ok();
+/// when an existing, different binary is replaced; the old binary is then
+/// moved aside rather than deleted (a running probe locks its file on
+/// Windows), see `swap::swap_in`. Returns whether the file was written.
+pub async fn place_binary(
+    exe: &Path,
+    bytes: &[u8],
+    stop: impl Future<Output = ()>,
+) -> std::io::Result<bool> {
+    let existing = tokio::fs::read(exe).await.ok();
     if existing.as_deref().map(sha256_hex) == Some(sha256_hex(bytes)) {
         return Ok(false);
     }
-    if let Some(dir) = exe.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+        return Err(std::io::Error::other("probe path has no directory"));
+    };
+    tokio::fs::create_dir_all(dir).await?;
     let mut tmp = exe.as_os_str().to_owned();
     tmp.push(".upload");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes)?;
+    tokio::fs::write(&tmp, bytes).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).await?;
     }
     if existing.is_some() {
-        stop();
-        std::fs::remove_file(exe)?;
+        stop.await;
     }
-    std::fs::rename(&tmp, exe)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    swap_in(
+        &LocalFiles,
+        &dir.to_string_lossy(),
+        &name.to_string_lossy(),
+        stamp,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -257,22 +273,12 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         let exe = PathBuf::from(remote.probe_path(&self.dir));
         let gate = self.gate(&host.id);
         let guard = gate.lock().await;
-        let (place_exe, stop) = (exe.clone(), stop_argv(&self.client));
-        let placed = tokio::task::spawn_blocking(move || {
-            place_binary(&place_exe, &bytes, || {
-                let mut cmd = std::process::Command::new(&place_exe);
-                cmd.args(&stop).stdin(Stdio::null()).stdout(Stdio::null());
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x0800_0000);
-                }
-                let _ = cmd.status();
-            })
-        })
-        .await
-        .map_err(|e| deploy_err(e.to_string()))?;
-        placed.map_err(|e| deploy_err(format!("{}: {e}", exe.display())))?;
+        let stop = async {
+            let _ = run_local(&exe, &stop_argv(&self.client)).await;
+        };
+        place_binary(&exe, &bytes, stop)
+            .await
+            .map_err(|e| deploy_err(format!("{}: {e}", exe.display())))?;
         let hooks = if self.install_hooks {
             match run_local(&exe, &["install-hooks".to_owned()]).await {
                 Ok(out) => hooks_outcome(&out),

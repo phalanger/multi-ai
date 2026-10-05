@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use mai_core::deploy::{
-    DeployError, HookResult, Os, ProbeStore, Remote, Shell, hooks_result, normalize_arch,
-    parse_hash, parse_hook_lines, parse_uname, sha256_hex, stop_args,
+    DeployError, HookResult, Os, ProbeStore, Remote, Shell, hooks_result, marked_lines,
+    normalize_arch, parse_hash, parse_hook_lines, parse_posix_detect, parse_uname,
+    parse_windows_detect, posix_detect_command, sha256_hex, stop_args, windows_detect_command,
 };
 use mai_core::ssh::client::ExecOutput;
 
@@ -225,4 +226,59 @@ fn serve_and_stop_arguments_are_quoted_per_shell() {
     assert_eq!(posix.serve_args("", None), "serve");
     assert_eq!(stop_args("mac-1"), "stop --client mac-1");
     assert_eq!(stop_args("../"), "stop");
+}
+
+#[test]
+fn posix_detection_ignores_shell_noise_around_the_markers() {
+    let out = "Welcome to Ubuntu!\nLast login: today\nMAI-DETECT-BEGIN\nLinux x86_64\n/home/u\nMAI-DETECT-END\nbye\n";
+    assert_eq!(
+        parse_posix_detect(out).unwrap(),
+        Some((Os::Linux, "x86_64".into(), "/home/u".into()))
+    );
+}
+
+#[test]
+fn posix_detection_without_markers_is_not_posix() {
+    // cmd echoes the whole command line back on one line.
+    let cmd_echo = format!("{}\r\n", posix_detect_command());
+    assert_eq!(parse_posix_detect(&cmd_echo).unwrap(), None);
+    assert_eq!(parse_posix_detect("").unwrap(), None);
+}
+
+#[test]
+fn posix_detection_errors_name_the_problem() {
+    let unknown = "MAI-DETECT-BEGIN\nFreeBSD amd64\n/home/u\nMAI-DETECT-END\n";
+    match parse_posix_detect(unknown) {
+        Err(DeployError::Detect(m)) => assert!(m.contains("FreeBSD"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let no_home = "MAI-DETECT-BEGIN\nDarwin arm64\n\nMAI-DETECT-END\n";
+    assert!(parse_posix_detect(no_home).is_err());
+}
+
+#[test]
+fn windows_detection_and_unset_userprofile() {
+    let ok = "MAI-DETECT-BEGIN\r\nAMD64\r\nC:\\Users\\u\r\nMAI-DETECT-END\r\n";
+    assert_eq!(
+        parse_windows_detect(ok).unwrap(),
+        ("x86_64".into(), r"C:\Users\u".into())
+    );
+    // cmd echoes an unset variable back verbatim.
+    let unset = "MAI-DETECT-BEGIN\r\nAMD64\r\n%USERPROFILE%\r\nMAI-DETECT-END\r\n";
+    match parse_windows_detect(unset) {
+        Err(DeployError::Detect(m)) => assert!(m.contains("USERPROFILE"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn detection_commands_and_markers() {
+    assert!(posix_detect_command().contains("uname -sm"));
+    assert!(windows_detect_command(Shell::Cmd).contains("%USERPROFILE%"));
+    assert!(windows_detect_command(Shell::PowerShell).contains("$env:USERPROFILE"));
+    assert_eq!(
+        marked_lines("x\nMAI-DETECT-BEGIN\na\n b \nMAI-DETECT-END\ny"),
+        Some(vec!["a".to_owned(), "b".to_owned()])
+    );
+    assert_eq!(marked_lines("MAI-DETECT-BEGIN\na\n"), None, "no end marker");
 }

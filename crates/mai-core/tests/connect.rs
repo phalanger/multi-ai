@@ -69,21 +69,21 @@ fn local_platform_has_a_probe_target() {
     assert!(path.contains("mai-probe"), "{path}");
 }
 
-#[test]
-fn binary_is_placed_only_when_it_differs() {
+#[tokio::test]
+async fn binary_is_placed_only_when_it_differs() {
     let dir = tempfile::tempdir().unwrap();
     let exe = dir.path().join(".mai").join("bin").join("mai-probe");
     let stops = Cell::new(0);
-    let stop = || stops.set(stops.get() + 1);
+    let stop = || async { stops.set(stops.get() + 1) };
 
-    assert!(place_binary(&exe, b"v1", stop).unwrap());
+    assert!(place_binary(&exe, b"v1", stop()).await.unwrap());
     assert_eq!(std::fs::read(&exe).unwrap(), b"v1");
     assert_eq!(stops.get(), 0, "nothing to stop on first install");
 
-    assert!(!place_binary(&exe, b"v1", stop).unwrap());
+    assert!(!place_binary(&exe, b"v1", stop()).await.unwrap());
     assert_eq!(stops.get(), 0);
 
-    assert!(place_binary(&exe, b"v2", stop).unwrap());
+    assert!(place_binary(&exe, b"v2", stop()).await.unwrap());
     assert_eq!(std::fs::read(&exe).unwrap(), b"v2");
     assert_eq!(stops.get(), 1, "old probe stopped before replacing it");
     let leftovers: Vec<_> = std::fs::read_dir(exe.parent().unwrap())

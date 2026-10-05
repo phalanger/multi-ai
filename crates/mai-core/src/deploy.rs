@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::ssh::auth::Prompter;
 use crate::ssh::client::{ExecOutput, SshError, SshSession};
+use crate::swap::{SftpFiles, swap_in};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -338,16 +339,86 @@ impl From<SshError> for DeployError {
     }
 }
 
+/// Start and end markers around detection output, so text a shell's
+/// startup files print is not mistaken for it (B11).
+pub const BEGIN_MARK: &str = "MAI-DETECT-BEGIN";
+pub const END_MARK: &str = "MAI-DETECT-END";
+
+/// One POSIX command printing `uname -sm` and `$HOME` between markers.
+/// Under cmd the whole line is echoed back on one line, and under
+/// PowerShell `uname` fails, so neither yields the marked lines.
+pub fn posix_detect_command() -> String {
+    format!("echo {BEGIN_MARK}; uname -sm; printf '%s\\n' \"$HOME\"; echo {END_MARK}")
+}
+
+/// Detection commands per Windows shell: CPU and home between markers.
+pub fn windows_detect_command(shell: Shell) -> String {
+    match shell {
+        Shell::Cmd => format!(
+            "echo {BEGIN_MARK}& echo %PROCESSOR_ARCHITECTURE%& echo %USERPROFILE%& echo {END_MARK}"
+        ),
+        _ => format!(
+            "echo {BEGIN_MARK}; $env:PROCESSOR_ARCHITECTURE; $env:USERPROFILE; echo {END_MARK}"
+        ),
+    }
+}
+
+/// The trimmed lines between the first `BEGIN_MARK` line and the next
+/// `END_MARK` line, or `None` if the markers are missing.
+pub fn marked_lines(out: &str) -> Option<Vec<String>> {
+    let mut lines = out.lines().map(str::trim);
+    lines.find(|l| *l == BEGIN_MARK)?;
+    let mut inner = Vec::new();
+    for l in lines {
+        if l == END_MARK {
+            return Some(inner);
+        }
+        inner.push(l.to_owned());
+    }
+    None
+}
+
+/// OS, CPU and home from `posix_detect_command` output. `Ok(None)` when
+/// the output is not from a POSIX shell (no markers).
+pub fn parse_posix_detect(out: &str) -> Result<Option<(Os, String, String)>, DeployError> {
+    let Some(lines) = marked_lines(out) else {
+        return Ok(None);
+    };
+    let [uname, home] = lines.as_slice() else {
+        return Err(DeployError::Detect(format!(
+            "unexpected detection output: {lines:?}"
+        )));
+    };
+    let (os, arch) = parse_uname(uname)
+        .ok_or_else(|| DeployError::Detect(format!("unsupported system (uname: {uname:?})")))?;
+    if home.is_empty() {
+        return Err(DeployError::Detect("empty $HOME".into()));
+    }
+    Ok(Some((os, arch, home.clone())))
+}
+
+/// CPU and home from `windows_detect_command` output. Under cmd an unset
+/// variable is echoed back as `%NAME%`, which counts as missing (B12).
+pub fn parse_windows_detect(out: &str) -> Result<(String, String), DeployError> {
+    let lines = marked_lines(out)
+        .ok_or_else(|| DeployError::Detect(format!("unexpected detection output: {out:?}")))?;
+    let [raw_arch, home] = lines.as_slice() else {
+        return Err(DeployError::Detect(format!(
+            "unexpected detection output: {lines:?}"
+        )));
+    };
+    let arch = normalize_arch(raw_arch)
+        .ok_or_else(|| DeployError::Detect(format!("unknown CPU {raw_arch:?}")))?;
+    if home.is_empty() || home.eq_ignore_ascii_case("%USERPROFILE%") {
+        return Err(DeployError::Detect("USERPROFILE is not set".into()));
+    }
+    Ok((arch, home.clone()))
+}
+
 /// Detect OS, CPU, shell and home directory of the remote host.
 pub async fn detect<P: Prompter>(s: &SshSession<P>) -> Result<Remote, DeployError> {
-    let uname = s.exec("uname -sm").await?;
-    if uname.success()
-        && let Some((os, arch)) = parse_uname(&uname.stdout_str())
-    {
-        let home = s.exec("printf '%s' \"$HOME\"").await?.stdout_str();
-        if home.is_empty() {
-            return Err(DeployError::Detect("empty $HOME".into()));
-        }
+    let posix = s.exec(&posix_detect_command()).await?;
+    if let Some((os, arch, home)) = parse_posix_detect(&posix.stdout_str())? {
         return Ok(Remote {
             os,
             arch,
@@ -361,29 +432,12 @@ pub async fn detect<P: Prompter>(s: &SshSession<P>) -> Result<Remote, DeployErro
         "%OS%" => Shell::PowerShell,
         other => {
             return Err(DeployError::Detect(format!(
-                "not Linux/macOS (uname: {:?}) nor Windows (%OS%: {other:?})",
-                uname.stdout_str().trim()
+                "neither a POSIX shell nor Windows (%OS%: {other:?})"
             )));
         }
     };
-    let (arch_cmd, home_cmd) = match shell {
-        Shell::Cmd => ("echo %PROCESSOR_ARCHITECTURE%", "echo %USERPROFILE%"),
-        _ => ("$env:PROCESSOR_ARCHITECTURE", "$env:USERPROFILE"),
-    };
-    // A Unix other than Linux/macOS also lands here (its sh echoes %OS%
-    // verbatim); report uname's output so that case is recognisable.
-    let raw_arch = s.exec(arch_cmd).await?.stdout_str();
-    let arch = normalize_arch(&raw_arch).ok_or_else(|| {
-        DeployError::Detect(format!(
-            "unknown CPU {:?} (uname: {:?})",
-            raw_arch.trim(),
-            uname.stdout_str().trim()
-        ))
-    })?;
-    let home = s.exec(home_cmd).await?.stdout_str().trim().to_owned();
-    if home.is_empty() {
-        return Err(DeployError::Detect("empty %USERPROFILE%".into()));
-    }
+    let out = s.exec(&windows_detect_command(shell)).await?;
+    let (arch, home) = parse_windows_detect(&out.stdout_str())?;
     Ok(Remote {
         os: Os::Windows,
         arch,
@@ -396,8 +450,17 @@ fn upload_err(e: impl fmt::Display) -> DeployError {
     DeployError::Upload(e.to_string())
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 /// Upload `bytes` to `<login dir>/<dir>/bin/<exe>` via SFTP (paths are
 /// relative to the login directory, which is home on OpenSSH servers).
+/// The file is written to `<exe>.upload`, its SHA-256 is checked on the
+/// host (B18), and it is swapped in with the old binary moved aside
+/// rather than deleted (B19).
 async fn upload<P: Prompter>(
     s: &SshSession<P>,
     remote: &Remote,
@@ -430,13 +493,18 @@ async fn upload<P: Prompter>(
             .await
             .map_err(upload_err)?;
     }
-    if sftp.try_exists(target.clone()).await.map_err(upload_err)? {
-        sftp.remove_file(target.clone())
-            .await
-            .map_err(|e| DeployError::Upload(format!("replace {target} (probe running?): {e}")))?;
+    let tmp_abs = format!("{}.upload", remote.probe_path(dir));
+    let written = parse_hash(&s.exec(&remote.hash_command(&tmp_abs)).await?.stdout_str());
+    if written.as_deref() != Some(sha256_hex(bytes).as_str()) {
+        let _ = sftp.remove_file(tmp).await;
+        return Err(DeployError::Upload(format!(
+            "uploaded file does not match (SHA-256 {})",
+            written.unwrap_or_else(|| "unknown".into())
+        )));
     }
-    sftp.rename(tmp, target).await.map_err(upload_err)?;
-    Ok(())
+    swap_in(&SftpFiles(&sftp), &bin_dir, remote.exe_name(), now_ms())
+        .await
+        .map_err(|e| DeployError::Upload(format!("replace {target}: {e}")))
 }
 
 /// Make sure the right probe is on the host, then (optionally) install
