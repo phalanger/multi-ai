@@ -449,20 +449,25 @@ async fn authenticate<P: Prompter, S: SecretStore>(
                 // Offer the public key; the passphrase is asked only if the
                 // server accepts it.
                 Some(public) => {
-                    tried.push(public.clone());
                     let mut signer = FileSigner {
                         path,
                         prompter,
                         secrets,
                         notes,
+                        declined: false,
                     };
-                    match h
-                        .authenticate_publickey_with(user, public, hash, &mut signer)
+                    let r = match h
+                        .authenticate_publickey_with(user, public.clone(), hash, &mut signer)
                         .await
                     {
                         Ok(r) => r,
-                        Err(_) => return Err(SshError::Connect("connection lost".into())),
+                        Err(e) => return Err(SshError::Connect(format!("{e:?}"))),
+                    };
+                    // A declined passphrase leaves the key to the agent.
+                    if !signer.declined {
+                        tried.push(public);
                     }
+                    r
                 }
                 // Formats without a readable public key: decrypt first.
                 None => {

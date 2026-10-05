@@ -9,6 +9,8 @@ use std::time::Duration;
 use mai_core::ssh::auth::{KbdPrompt, Prompter, Secret, SecretStore, passphrase_key, password_key};
 use mai_core::ssh::client::{ConnectOptions, SshError, connect};
 use mai_core::ssh::config::HostSpec;
+use mai_core::ssh::signer::FileSigner;
+use russh::keys::agent::AgentIdentity;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
@@ -840,4 +842,50 @@ async fn connects_through_a_jump_host() {
     );
     let learned = std::fs::read_to_string(dir.path().join("known_hosts")).unwrap();
     assert_eq!(learned.lines().count(), 2, "{learned}");
+}
+
+async fn sign_with(passphrase: Option<Secret>) -> (Vec<u8>, bool) {
+    let client = random_key();
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("id_enc");
+    client
+        .encrypt(&mut SysRng, "pw")
+        .unwrap()
+        .write_openssh_file(&key_file, LineEnding::LF)
+        .unwrap();
+    let p = Scripted {
+        passphrase,
+        ..Default::default()
+    };
+    let store = MemStore::default();
+    let mut notes = Vec::new();
+    let mut signer = FileSigner {
+        path: &key_file,
+        prompter: &p,
+        secrets: &store,
+        notes: &mut notes,
+        declined: false,
+    };
+    let id = AgentIdentity::PublicKey {
+        key: client.public_key().clone(),
+        comment: String::new(),
+    };
+    let out = russh::Signer::auth_sign(&mut signer, &id, None, b"data".to_vec())
+        .await
+        .unwrap();
+    (out, signer.declined)
+}
+
+#[tokio::test]
+async fn file_signer_marks_a_refused_passphrase_as_declined() {
+    let (out, declined) = sign_with(None).await;
+    assert!(out.len() > b"data".len());
+    assert!(declined);
+}
+
+#[tokio::test]
+async fn file_signer_is_not_declined_with_the_right_passphrase() {
+    let (out, declined) = sign_with(secret("pw", false)).await;
+    assert!(out.len() > b"data".len());
+    assert!(!declined);
 }

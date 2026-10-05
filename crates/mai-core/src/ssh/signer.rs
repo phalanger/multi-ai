@@ -126,6 +126,10 @@ pub struct FileSigner<'a, P, S> {
     pub prompter: &'a P,
     pub secrets: &'a S,
     pub notes: &'a mut Vec<String>,
+    /// Set by `auth_sign` when no real signature could be produced (the
+    /// passphrase was refused or the key could not be loaded) and a bogus
+    /// one was sent instead. Callers then must not count the key as tried.
+    pub declined: bool,
 }
 
 impl<P: Prompter, S: SecretStore> russh::Signer for FileSigner<'_, P, S> {
@@ -141,6 +145,7 @@ impl<P: Prompter, S: SecretStore> russh::Signer for FileSigner<'_, P, S> {
         if let Some(out) = private.and_then(|k| signed(&k, hash_alg, &to_sign)) {
             return Ok(out);
         }
+        self.declined = true;
         let AgentIdentity::PublicKey { key: public, .. } = key else {
             return Ok(to_sign);
         };
