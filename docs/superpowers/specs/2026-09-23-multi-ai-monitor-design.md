@@ -95,6 +95,8 @@ stdin/stdout 通信；本机不需要 sshd。
     IdentityFile；跳板主机自身的 `ProxyJump` 不跟随。
   - `Match` 块不支持：解析前整块去掉（其中的设置不生效），每个 `Match`
     行给出一条提示（文件行号），随连接结果交给 UI 显示（见第 11 节）。
+  - `Include` 由 ssh2-config 自行跟随，但被包含文件中的 `Match` 块无法识别
+    （其设置可能归到前一个 `Host` 上），因此每个 `Include` 行也给出一条提示。
 - 每台主机可选配置：zellij 可执行文件路径、默认 session、探针轮询间隔。
 
 ### 3.2 认证顺序
@@ -102,11 +104,13 @@ stdin/stdout 通信；本机不需要 sshd。
 先以 `none` 查询服务器允许的方法，未提供的方法跳过。
 
 1. 配置或 ssh config 中指定的私钥：先用公钥询问服务器是否接受（公钥取自
-   `<私钥>.pub`，没有则从未加密的私钥文件读出），服务器接受后才解密私钥并签名；
+   `<私钥>.pub`，没有则从私钥文件本身读出：OpenSSH 格式的私钥即使加密也能读出公钥，
+   只有其他格式才需先解密再提供），服务器接受后才解密私钥并签名；
    因此服务器不接受的加密私钥不会弹窗要口令。口令从钥匙串读取，缺失则弹窗输入
    并询问是否保存。
 2. ssh-agent（macOS：`SSH_AUTH_SOCK`；Windows：OpenSSH Agent 命名管道，Pageant 可选）。
-   已经按私钥文件试过的公钥不再经 agent 重试，避免白白消耗服务器的 `MaxAuthTries`。
+   已经按私钥文件试过的公钥不再经 agent 重试，避免白白消耗服务器的 `MaxAuthTries`；
+   但用户拒绝输入口令的私钥仍会经 agent 尝试。
 3. 钥匙串中保存的密码。
 4. 弹窗输入密码；keyboard-interactive / 2FA 弹窗逐项交互，最多 10 轮
    （`MAX_KBD_ROUNDS`），超过按该方法失败处理。
@@ -118,6 +122,7 @@ stdin/stdout 通信；本机不需要 sshd。
 服务名 `multi-ai`，键为 `<host>/password` 与 `passphrase:<私钥路径>`；私钥路径先
 规范化（`canonicalize`；Windows 上去掉 `\\?\` 前缀并转为小写），同一私钥的不同
 写法共用一个键。钥匙串写入或删除失败不中断认证，但作为提示交给 UI（见第 11 节）。
+SSH 认证失败时，ssh config 的提示会附加在错误文本之后，便于发现被忽略的 `Match` 块。
 
 ### 3.3 主机密钥校验
 
@@ -173,12 +178,16 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 
 ### 4.2 部署流程
 
-1. 探测：执行一条 POSIX 命令 `uname -sm >/dev/null 2>&1 && { echo MAI-DETECT-BEGIN;
-   uname -sm; printf '%s\n' "$HOME"; echo MAI-DETECT-END; }`，哨兵行
-   `MAI-DETECT-BEGIN` / `MAI-DETECT-END` 只在 `uname` 成功时才打印（Windows
-   PowerShell 5.1 不认 `&&`，cmd 没有 `uname`，都不会输出哨兵块），只解析两行之间的内容（登录 shell
-   的 rc 文件多打印的内容不影响结果）；有哨兵且系统受支持为 Linux/macOS，
-   有哨兵但系统不受支持或 home 为空则报探测错误；哨兵之间为空也视为非 POSIX。
+1. 探测：执行一条 POSIX 命令，是不带花括号的 `&&` 链：`uname -sm >/dev/null &&
+   echo MAI-DETECT-BEGIN && uname -sm && printf '%s\n' "$HOME" && echo
+   MAI-DETECT-END`（不用 `{ ...; }`，fish 与 Unix 上的 pwsh 都不认）。哨兵行
+   `MAI-DETECT-BEGIN` / `MAI-DETECT-END` 只在 `uname` 成功时才打印：Windows
+   PowerShell 5.1 不认 `&&`（语法错误），cmd 在 `/dev/null` 重定向处就失败，
+   都不会输出哨兵块。只解析两行之间的内容（登录 shell 的 rc 文件多打印的内容
+   不影响结果）；有哨兵且系统受支持为 Linux/macOS，有哨兵但系统不受支持或
+   home 为空则报探测错误；哨兵之间为空、或 `uname` 为 MINGW / MSYS / CYGWIN
+   （Windows 主机的非 POSIX 登录 shell 在 PATH 上找到了 Git 的 `uname`）都视为
+   非 POSIX。
    没有哨兵时以 `echo %OS%` 区分
    Windows 的 cmd（输出 `Windows_NT`）与 PowerShell（原样输出），再同样在哨兵之间
    取 CPU 与 home；cmd 下 `%USERPROFILE%` 未定义时会原样回显，按未设置报错。

@@ -24,8 +24,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - `ssh::config::resolve` turns an alias or `user@host:port` into a `HostSpec`
   using `~/.ssh/config` (HostName, User, Port, IdentityFile, ProxyJump; a
-  jump host's own ProxyJump is not followed). `Match` blocks are ignored and
-  reported by `config_warnings`.
+  jump host's own ProxyJump is not followed). `Match` blocks are ignored;
+  `Match` and `Include` caveats are reported by `config_warnings`.
 - `ssh::client::connect` authenticates with key files (the public key is
   offered first; an encrypted key is decrypted only once the server accepts
   it), ssh-agent, remembered or prompted password, then keyboard-interactive.
