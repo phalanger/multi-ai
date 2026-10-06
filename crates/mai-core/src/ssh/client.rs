@@ -553,10 +553,11 @@ async fn authenticate<P: Prompter, S: SecretStore>(
     {
         return Ok(());
     }
-    Err(SshError::Auth(format!(
-        "no method succeeded for {user}@{}",
-        spec.host
-    )))
+    let mut msg = format!("no method succeeded for {user}@{}", spec.host);
+    if !notes.is_empty() {
+        msg.push_str(&format!(" ({})", notes.join("; ")));
+    }
+    Err(SshError::Auth(msg))
 }
 
 /// Offer the agent's keys that were not tried already. Partial success

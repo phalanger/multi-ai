@@ -308,21 +308,31 @@ fn detection_commands_and_markers() {
 }
 
 /// B34: an upload that times out on a slow link is a network problem
-/// (retried); other upload failures need the user.
+/// (retried), and so is a connection that dropped; other upload failures
+/// need the user.
 #[test]
 fn upload_timeouts_are_retried_and_other_failures_need_the_user() {
     use std::io;
-    let timed_out = |e: DeployError| matches!(&e, DeployError::Ssh(SshError::Connect(m)) if m.contains("timed out"));
-    assert!(timed_out(upload_error(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "Timeout"
-    ))));
+    let timed_out = |e: DeployError| matches!(&e, DeployError::Ssh(SshError::Connect(m)) if m.contains("timed out") && m.contains("60 s"));
+    assert!(timed_out(upload_error(
+        io::Error::new(io::ErrorKind::TimedOut, "Timeout"),
+        false
+    )));
     // What russh-sftp reports when a request gets no answer in time.
     assert!(timed_out(upload_error(
-        russh_sftp::client::error::Error::Timeout
+        russh_sftp::client::error::Error::Timeout,
+        false
     )));
     assert_eq!(
-        upload_error(io::Error::other("Permission denied")),
+        upload_error(io::Error::other("Permission denied"), false),
         DeployError::Upload("Permission denied".into())
     );
+    // A dropped link: russh-sftp reports "session closed" (not a timeout).
+    match upload_error(io::Error::other("session closed"), true) {
+        DeployError::Ssh(SshError::Connect(m)) => {
+            assert!(m.contains("connection lost"), "{m}");
+            assert!(m.contains("session closed"), "{m}");
+        }
+        other => panic!("{other:?}"),
+    }
 }

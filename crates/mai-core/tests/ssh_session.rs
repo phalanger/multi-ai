@@ -795,6 +795,52 @@ async fn keychain_failure_is_reported_not_swallowed() {
     assert!(s.notes()[0].contains("keychain locked"), "{:?}", s.notes());
 }
 
+/// A keychain holding a wrong password that cannot be removed.
+struct StuckWrongPassword;
+
+impl SecretStore for StuckWrongPassword {
+    fn get(&self, _key: &str) -> Option<String> {
+        Some("definitely-wrong".into())
+    }
+    fn set(&self, _key: &str, _value: &str) -> Result<(), String> {
+        Err("keychain locked".into())
+    }
+    fn delete(&self, _key: &str) -> Result<(), String> {
+        Err("keychain locked".into())
+    }
+}
+
+#[tokio::test]
+async fn keychain_notes_survive_a_failed_connect() {
+    let (port, _) = start(ServerCfg {
+        methods: vec![MethodKind::Password],
+        client_key: None,
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let p = Arc::new(Scripted {
+        trust: true,
+        ..Default::default()
+    });
+    let err = connect(
+        &spec(port, vec![]),
+        &opts(dir.path()),
+        p,
+        &StuckWrongPassword,
+    )
+    .await
+    .err()
+    .expect("auth fails");
+    match err {
+        SshError::Auth(m) => {
+            assert!(m.contains("no method succeeded"), "{m}");
+            assert!(m.contains("could not remove"), "{m}");
+            assert!(m.contains("keychain locked"), "{m}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 #[test]
 fn passphrase_key_is_the_same_for_every_spelling_of_a_path() {
     let dir = tempfile::tempdir().unwrap();

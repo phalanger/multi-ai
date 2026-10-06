@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::ssh::auth::Prompter;
-use crate::ssh::client::{ExecOutput, SshError, SshSession};
+use crate::ssh::client::{ExecOutput, SFTP_REQUEST_TIMEOUT_SECS, SshError, SshSession};
 use crate::swap::{SftpFiles, swap_in};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,13 +465,19 @@ pub async fn detect<P: Prompter>(s: &SshSession<P>) -> Result<Remote, DeployErro
     })
 }
 
-/// An upload step failed. A timeout (a slow link) is a network problem and
-/// is retried like other network errors (design 3.4, B34); anything else
-/// needs the user.
-pub fn upload_error(e: impl Into<std::io::Error>) -> DeployError {
+/// An upload step failed. `connection_closed` says the SSH connection is
+/// gone (a dropped link): that is a network problem and is retried, as is a
+/// timeout (a slow link, design 3.4, B34). Anything else needs the user.
+pub fn upload_error(e: impl Into<std::io::Error>, connection_closed: bool) -> DeployError {
     let e: std::io::Error = e.into();
-    if e.kind() == std::io::ErrorKind::TimedOut {
-        DeployError::Ssh(SshError::Connect(format!("upload timed out: {e}")))
+    if connection_closed {
+        DeployError::Ssh(SshError::Connect(format!(
+            "connection lost during upload: {e}"
+        )))
+    } else if e.kind() == std::io::ErrorKind::TimedOut {
+        DeployError::Ssh(SshError::Connect(format!(
+            "upload timed out (no answer within {SFTP_REQUEST_TIMEOUT_SECS} s)"
+        )))
     } else {
         DeployError::Upload(e.to_string())
     }
@@ -502,15 +508,28 @@ async fn upload<P: Prompter>(
             path.push('/');
         }
         path.push_str(part);
-        if !sftp.try_exists(path.clone()).await.map_err(upload_error)? {
-            sftp.create_dir(path.clone()).await.map_err(upload_error)?;
+        if !sftp
+            .try_exists(path.clone())
+            .await
+            .map_err(|e| upload_error(e, s.is_closed()))?
+        {
+            sftp.create_dir(path.clone())
+                .await
+                .map_err(|e| upload_error(e, s.is_closed()))?;
         }
     }
     let target = format!("{bin_dir}/{}", remote.exe_name());
     let tmp = format!("{target}.upload");
-    let mut file = sftp.create(tmp.clone()).await.map_err(upload_error)?;
-    file.write_all(bytes).await.map_err(upload_error)?;
-    file.shutdown().await.map_err(upload_error)?;
+    let mut file = sftp
+        .create(tmp.clone())
+        .await
+        .map_err(|e| upload_error(e, s.is_closed()))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| upload_error(e, s.is_closed()))?;
+    file.shutdown()
+        .await
+        .map_err(|e| upload_error(e, s.is_closed()))?;
     if remote.os != Os::Windows {
         let attrs = russh_sftp::protocol::FileAttributes {
             permissions: Some(0o755),
@@ -518,7 +537,7 @@ async fn upload<P: Prompter>(
         };
         sftp.set_metadata(tmp.clone(), attrs)
             .await
-            .map_err(upload_error)?;
+            .map_err(|e| upload_error(e, s.is_closed()))?;
     }
     let tmp_abs = format!("{}.upload", remote.probe_path(dir));
     let out = s.exec(&remote.hash_command(&tmp_abs)).await?;
