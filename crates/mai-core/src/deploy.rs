@@ -465,8 +465,16 @@ pub async fn detect<P: Prompter>(s: &SshSession<P>) -> Result<Remote, DeployErro
     })
 }
 
-fn upload_err(e: impl fmt::Display) -> DeployError {
-    DeployError::Upload(e.to_string())
+/// An upload step failed. A timeout (a slow link) is a network problem and
+/// is retried like other network errors (design 3.4, B34); anything else
+/// needs the user.
+pub fn upload_error(e: impl Into<std::io::Error>) -> DeployError {
+    let e: std::io::Error = e.into();
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        DeployError::Ssh(SshError::Connect(format!("upload timed out: {e}")))
+    } else {
+        DeployError::Upload(e.to_string())
+    }
 }
 
 fn now_ms() -> u64 {
@@ -494,15 +502,15 @@ async fn upload<P: Prompter>(
             path.push('/');
         }
         path.push_str(part);
-        if !sftp.try_exists(path.clone()).await.map_err(upload_err)? {
-            sftp.create_dir(path.clone()).await.map_err(upload_err)?;
+        if !sftp.try_exists(path.clone()).await.map_err(upload_error)? {
+            sftp.create_dir(path.clone()).await.map_err(upload_error)?;
         }
     }
     let target = format!("{bin_dir}/{}", remote.exe_name());
     let tmp = format!("{target}.upload");
-    let mut file = sftp.create(tmp.clone()).await.map_err(upload_err)?;
-    file.write_all(bytes).await.map_err(upload_err)?;
-    file.shutdown().await.map_err(upload_err)?;
+    let mut file = sftp.create(tmp.clone()).await.map_err(upload_error)?;
+    file.write_all(bytes).await.map_err(upload_error)?;
+    file.shutdown().await.map_err(upload_error)?;
     if remote.os != Os::Windows {
         let attrs = russh_sftp::protocol::FileAttributes {
             permissions: Some(0o755),
@@ -510,7 +518,7 @@ async fn upload<P: Prompter>(
         };
         sftp.set_metadata(tmp.clone(), attrs)
             .await
-            .map_err(upload_err)?;
+            .map_err(upload_error)?;
     }
     let tmp_abs = format!("{}.upload", remote.probe_path(dir));
     let out = s.exec(&remote.hash_command(&tmp_abs)).await?;

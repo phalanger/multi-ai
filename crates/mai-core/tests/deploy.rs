@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use mai_core::deploy::{
     DeployError, HookResult, Os, ProbeStore, Remote, Shell, hooks_result, marked_lines,
     normalize_arch, parse_hash, parse_hook_lines, parse_posix_detect, parse_uname,
-    parse_windows_detect, posix_detect_command, sha256_hex, stop_args, windows_detect_command,
+    parse_windows_detect, posix_detect_command, sha256_hex, stop_args, upload_error,
+    windows_detect_command,
 };
-use mai_core::ssh::client::ExecOutput;
+use mai_core::ssh::client::{ExecOutput, SshError};
 
 fn remote(os: Os, shell: Shell, home: &str) -> Remote {
     Remote {
@@ -304,4 +305,24 @@ fn detection_commands_and_markers() {
         Some(vec!["a".to_owned(), "b".to_owned()])
     );
     assert_eq!(marked_lines("MAI-DETECT-BEGIN\na\n"), None, "no end marker");
+}
+
+/// B34: an upload that times out on a slow link is a network problem
+/// (retried); other upload failures need the user.
+#[test]
+fn upload_timeouts_are_retried_and_other_failures_need_the_user() {
+    use std::io;
+    let timed_out = |e: DeployError| matches!(&e, DeployError::Ssh(SshError::Connect(m)) if m.contains("timed out"));
+    assert!(timed_out(upload_error(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "Timeout"
+    ))));
+    // What russh-sftp reports when a request gets no answer in time.
+    assert!(timed_out(upload_error(
+        russh_sftp::client::error::Error::Timeout
+    )));
+    assert_eq!(
+        upload_error(io::Error::other("Permission denied")),
+        DeployError::Upload("Permission denied".into())
+    );
 }

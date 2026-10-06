@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use mai_core::ssh::config::{config_warnings, parse_config, resolve};
+use mai_core::ssh::config::{config_warnings, jump_warnings, parse_config, resolve};
 
 const CONFIG: &str = "\
 Host mac
@@ -154,4 +154,20 @@ fn include_lines_are_reported() {
 fn bad_port_is_an_error() {
     let cfg = parse_config("").unwrap();
     assert!(resolve(&cfg, "host:notaport", "me", &home()).is_err());
+}
+
+/// B35: a jump host's own ProxyJump, which is not followed, is reported.
+#[test]
+fn jump_hosts_own_proxyjump_is_reported() {
+    let cfg = parse_config(CONFIG).unwrap();
+    let looped = resolve(&cfg, "loop-a", "me", &home()).unwrap();
+    assert_eq!(
+        jump_warnings(&cfg, &looped),
+        vec!["ssh config: ProxyJump loop-a of jump host loop-b is not followed"]
+    );
+    let plain = resolve(&cfg, "box", "me", &home()).unwrap();
+    assert!(
+        jump_warnings(&cfg, &plain).is_empty(),
+        "mac has no ProxyJump"
+    );
 }

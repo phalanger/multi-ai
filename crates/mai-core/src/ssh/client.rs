@@ -631,6 +631,10 @@ async fn try_agent<P: Prompter>(
     }
 }
 
+/// How long one SFTP request may take. russh-sftp's default (10 s) is too
+/// short for writing a probe binary over a slow link (B34).
+pub const SFTP_REQUEST_TIMEOUT_SECS: u64 = 60;
+
 /// A server that keeps asking keyboard-interactive questions is given up
 /// on after this many rounds.
 pub const MAX_KBD_ROUNDS: usize = 10;
@@ -775,7 +779,11 @@ impl<P: Prompter> SshSession<P> {
     pub async fn sftp(&self) -> Result<russh_sftp::client::SftpSession, SshError> {
         let ch = self.handle.channel_open_session().await.map_err(chan_err)?;
         ch.request_subsystem(true, "sftp").await.map_err(chan_err)?;
-        russh_sftp::client::SftpSession::new(ch.into_stream())
+        let cfg = russh_sftp::client::Config {
+            request_timeout_secs: SFTP_REQUEST_TIMEOUT_SECS,
+            ..Default::default()
+        };
+        russh_sftp::client::SftpSession::new_with_config(ch.into_stream(), cfg)
             .await
             .map_err(chan_err)
     }

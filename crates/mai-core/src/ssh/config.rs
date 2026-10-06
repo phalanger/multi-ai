@@ -134,18 +134,44 @@ pub fn resolve(
     home: &Path,
 ) -> Result<HostSpec, ConfigError> {
     let mut spec = resolve_hop(config, target, default_user, home)?;
+    spec.jumps = jumps_of(config, target)?
+        .iter()
+        .map(|j| resolve_hop(config, j, default_user, home))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(spec)
+}
+
+/// The `ProxyJump` hosts configured for `target`, outermost first.
+fn jumps_of(config: &SshConfig, target: &str) -> Result<Vec<String>, ConfigError> {
     let params = config.query(split_target(target)?.1);
-    spec.jumps = params
+    Ok(params
         .proxy_jump
-        .clone()
         .unwrap_or_default()
         .iter()
         .flat_map(|j| j.split(','))
         .map(str::trim)
         .filter(|j| !j.is_empty() && !j.eq_ignore_ascii_case("none"))
-        .map(|j| resolve_hop(config, j, default_user, home))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(spec)
+        .map(str::to_owned)
+        .collect())
+}
+
+/// One note per jump host of `spec` that has a `ProxyJump` of its own:
+/// it is not followed (design 3.1), which would otherwise only show as
+/// failing connects (B35).
+pub fn jump_warnings(config: &SshConfig, spec: &HostSpec) -> Vec<String> {
+    spec.jumps
+        .iter()
+        .filter_map(|j| {
+            let own = jumps_of(config, &j.alias).ok()?;
+            (!own.is_empty()).then(|| {
+                format!(
+                    "ssh config: ProxyJump {} of jump host {} is not followed",
+                    own.join(","),
+                    j.alias
+                )
+            })
+        })
+        .collect()
 }
 
 /// One host's parameters, without jump hosts.

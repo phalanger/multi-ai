@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 
 use mai_core::connect::{
-    deploy_open_error, local_remote, place_binary, ssh_open_error, with_config_warnings,
+    deploy_open_error, local_remote, place_binary, ssh_open_error, with_notes,
 };
 use mai_core::deploy::DeployError;
 use mai_core::host::{OpenError, Problem};
@@ -119,16 +119,26 @@ fn revoked_host_key_needs_the_user() {
 }
 
 #[test]
-fn config_warnings_explain_auth_failures_only() {
-    let warn = vec!["w1".to_owned(), "w2".to_owned()];
+fn notes_are_added_to_failures_with_text() {
+    let notes = vec!["w1".to_owned(), "w2".to_owned()];
     let auth = OpenError::NeedsUser(Problem::Auth("denied".into()));
     assert_eq!(
-        with_config_warnings(auth.clone(), &warn),
+        with_notes(auth.clone(), &notes),
         OpenError::NeedsUser(Problem::Auth("denied (w1; w2)".into()))
     );
-    assert_eq!(with_config_warnings(auth.clone(), &[]), auth);
-    let retry = OpenError::Retry("refused".into());
-    assert_eq!(with_config_warnings(retry.clone(), &warn), retry);
-    let deploy = OpenError::NeedsUser(Problem::Deploy("x".into()));
-    assert_eq!(with_config_warnings(deploy.clone(), &warn), deploy);
+    assert_eq!(with_notes(auth.clone(), &[]), auth);
+    assert_eq!(
+        with_notes(OpenError::Retry("refused".into()), &notes),
+        OpenError::Retry("refused (w1; w2)".into())
+    );
+    assert_eq!(
+        with_notes(OpenError::NeedsUser(Problem::Deploy("x".into())), &notes),
+        OpenError::NeedsUser(Problem::Deploy("x (w1; w2)".into()))
+    );
+    assert_eq!(
+        with_notes(OpenError::NeedsUser(Problem::Config("c".into())), &notes),
+        OpenError::NeedsUser(Problem::Config("c (w1; w2)".into()))
+    );
+    let key = OpenError::NeedsUser(Problem::HostKeyRejected);
+    assert_eq!(with_notes(key.clone(), &notes), key, "no text to add to");
 }

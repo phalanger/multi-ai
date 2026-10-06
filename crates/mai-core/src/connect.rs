@@ -17,7 +17,7 @@ use crate::host::{Connector, HostConfig, HostKind, OpenError, Opened, Problem};
 use crate::link::ProbeIo;
 use crate::ssh::auth::{Prompter, SecretStore};
 use crate::ssh::client::{ConnectOptions, ExecOutput, SshError, connect};
-use crate::ssh::config::{HostSpec, config_warnings, parse_config, resolve};
+use crate::ssh::config::{HostSpec, config_warnings, jump_warnings, parse_config, resolve};
 use crate::stderr::{StderrTail, collect as collect_stderr};
 use crate::swap::{LocalFiles, swap_in};
 use crate::terminals::{SystemTerminals, find_zellij_command, found_zellij};
@@ -25,13 +25,21 @@ use crate::terminals::{SystemTerminals, find_zellij_command, found_zellij};
 /// Locale requested for `serve` so zellij output is UTF-8.
 const LOCALE: &str = "en_US.UTF-8";
 
-/// Append ssh config warnings (an ignored `Match` block may have set the
-/// user or key) to an authentication failure. Other errors are unchanged.
-pub fn with_config_warnings(err: OpenError, warnings: &[String]) -> OpenError {
+/// Append the connect notes (ignored ssh config, keychain failures) to a
+/// failure's text, so they are not lost when the connect fails (B37): an
+/// ignored `Match` block may be why authentication failed, a dropped
+/// `ProxyJump` why the host cannot be reached. Problems without text
+/// (host keys, protocol) are unchanged.
+pub fn with_notes(err: OpenError, notes: &[String]) -> OpenError {
+    if notes.is_empty() {
+        return err;
+    }
+    let add = |m: String| format!("{m} ({})", notes.join("; "));
     match err {
-        OpenError::NeedsUser(Problem::Auth(m)) if !warnings.is_empty() => {
-            OpenError::NeedsUser(Problem::Auth(format!("{m} ({})", warnings.join("; "))))
-        }
+        OpenError::Retry(m) => OpenError::Retry(add(m)),
+        OpenError::NeedsUser(Problem::Auth(m)) => OpenError::NeedsUser(Problem::Auth(add(m))),
+        OpenError::NeedsUser(Problem::Deploy(m)) => OpenError::NeedsUser(Problem::Deploy(add(m))),
+        OpenError::NeedsUser(Problem::Config(m)) => OpenError::NeedsUser(Problem::Config(add(m))),
         other => other,
     }
 }
@@ -204,7 +212,8 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         gates.entry(id.to_owned()).or_default().clone()
     }
 
-    /// The resolved target and the config warnings (ignored `Match` blocks).
+    /// The resolved target and the config warnings (ignored `Match`
+    /// blocks, `Include`, jump hosts' own `ProxyJump`).
     fn spec(&self, target: &str) -> Result<(HostSpec, Vec<String>), OpenError> {
         let text = match &self.ssh_config {
             None => String::new(),
@@ -223,7 +232,9 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
             .map_err(|e| OpenError::NeedsUser(Problem::Config(e.to_string())))?;
         let spec = resolve(&config, target, &self.default_user, &self.home)
             .map_err(|e| OpenError::NeedsUser(Problem::Config(e.to_string())))?;
-        Ok((spec, config_warnings(&text)))
+        let mut warnings = config_warnings(&text);
+        warnings.extend(jump_warnings(&config, &spec));
+        Ok((spec, warnings))
     }
 
     async fn open_ssh(&self, host: &HostConfig, target: &str) -> Result<Opened, OpenError> {
@@ -232,7 +243,8 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         let guard = gate.lock().await;
         let session = connect(&spec, &self.opts, self.prompter.clone(), &*self.secrets)
             .await
-            .map_err(|e| with_config_warnings(ssh_open_error(e), &notes))?;
+            .map_err(|e| with_notes(ssh_open_error(e), &notes))?;
+        notes.extend(session.notes().iter().cloned());
         let opts = DeployOptions {
             dir: self.dir.clone(),
             install_hooks: false,
@@ -240,12 +252,14 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         };
         let report = deploy(&session, &self.probes, &opts)
             .await
-            .map_err(deploy_open_error)?;
-        notes.extend(session.notes().iter().cloned());
+            .map_err(|e| with_notes(deploy_open_error(e), &notes))?;
         let remote = &report.remote;
         let hooks = if self.install_hooks {
             let cmd = remote.invoke(&report.probe_path, "install-hooks");
-            let out = session.exec(&cmd).await.map_err(ssh_open_error)?;
+            let out = session
+                .exec(&cmd)
+                .await
+                .map_err(|e| with_notes(ssh_open_error(e), &notes))?;
             hooks_outcome(&out)
         } else {
             Ok(Vec::new())
@@ -261,7 +275,7 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
                 stderr.clone(),
             )
             .await
-            .map_err(ssh_open_error)?;
+            .map_err(|e| with_notes(ssh_open_error(e), &notes))?;
         Ok(Opened {
             io: ProbeIo {
                 reader: Box::new(BufReader::new(r)),
@@ -340,13 +354,15 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         host: &HostConfig,
         target: &str,
     ) -> Result<SystemTerminals<P>, OpenError> {
-        let (spec, _) = self.spec(target)?;
+        let (spec, notes) = self.spec(target)?;
         let gate = self.gate(&host.id);
         let _guard = gate.lock().await;
         let session = connect(&spec, &self.opts, self.prompter.clone(), &*self.secrets)
             .await
-            .map_err(ssh_open_error)?;
-        let remote = detect(&session).await.map_err(deploy_open_error)?;
+            .map_err(|e| with_notes(ssh_open_error(e), &notes))?;
+        let remote = detect(&session)
+            .await
+            .map_err(|e| with_notes(deploy_open_error(e), &notes))?;
         // Used when neither the host config nor the probe names a zellij
         // (the probe may be down); a failed search just leaves PATH.
         let found = if remote.shell == Shell::Posix {
