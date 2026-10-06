@@ -382,4 +382,3 @@ impl<P: Prompter, S: SecretStore> Connector for SystemConnector<P, S> {
         }
     }
 }
-

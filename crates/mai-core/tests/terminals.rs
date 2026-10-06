@@ -149,4 +149,3 @@ fn local_terminal_keeps_the_users_utf8_locale() {
         term_only
     );
 }
-

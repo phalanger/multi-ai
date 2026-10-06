@@ -177,4 +177,3 @@ impl<P: Prompter> TermTransport for SystemTerminals<P> {
         }
     }
 }
-
