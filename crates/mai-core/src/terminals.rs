@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use crate::deploy::Remote;
 use crate::host::{OpenError, Problem};
-use crate::pty::{PtyIo, spawn_local};
+use crate::pty::{spawn_local, PtyIo};
 use crate::ssh::auth::Prompter;
 use crate::ssh::client::SshSession;
-use crate::term::{AttachSpec, LOCALE_ENV, TermTransport, attach_argv, remote_attach_command};
+use crate::term::{attach_argv, remote_attach_command, AttachSpec, TermTransport, LOCALE_ENV};
 
 /// Terminal connection of one host.
 pub enum SystemTerminals<P: Prompter> {
@@ -116,11 +116,16 @@ fn has_utf8_locale(var: &impl Fn(&str) -> Option<String>) -> bool {
 /// Environment for a local `zellij attach`, given the app's environment
 /// (`var`): a terminal type, and a UTF-8 locale only when the environment
 /// has none (a GUI app may have neither). A user's own UTF-8 locale (e.g.
-/// `zh_CN.UTF-8`) is kept.
+/// `zh_CN.UTF-8`) is kept. The spawned process only adds variables, so an
+/// inherited non-empty `LC_ALL` would override `LANG` and `LC_CTYPE`: when
+/// the locale is not UTF-8 and `LC_ALL` is set, it is overridden as well.
 pub fn local_env_with(var: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, &'static str)> {
     let mut env = vec![("TERM", "xterm-256color")];
     if !cfg!(windows) && !has_utf8_locale(&var) {
         env.extend([("LANG", FALLBACK_LOCALE), ("LC_CTYPE", FALLBACK_LOCALE)]);
+        if var("LC_ALL").is_some_and(|v| !v.is_empty()) {
+            env.push(("LC_ALL", FALLBACK_LOCALE));
+        }
     }
     env
 }

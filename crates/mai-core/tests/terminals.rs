@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use mai_core::terminals::{
-    FALLBACK_LOCALE, ZELLIJ_DIRS, find_zellij_command, find_zellij_script, found_zellij,
-    local_env_with,
+    find_zellij_command, find_zellij_script, found_zellij, local_env_with, FALLBACK_LOCALE,
+    ZELLIJ_DIRS,
 };
 
 #[test]
@@ -139,10 +139,12 @@ fn local_terminal_keeps_the_users_utf8_locale() {
     assert_eq!(env_of(&[("LC_CTYPE", "ja_JP.utf8")]), term_only);
     assert_eq!(env_of(&[]), fallback, "a GUI app may have no locale");
     assert_eq!(env_of(&[("LANG", "C")]), fallback);
-    // LC_ALL wins over LANG.
+    // LC_ALL wins over LANG, and an inherited LC_ALL must be overridden too.
+    let mut with_lc_all = fallback.clone();
+    with_lc_all.push(("LC_ALL", FALLBACK_LOCALE));
     assert_eq!(
         env_of(&[("LC_ALL", "C"), ("LANG", "en_US.UTF-8")]),
-        fallback
+        with_lc_all
     );
     assert_eq!(
         env_of(&[("LC_ALL", ""), ("LANG", "de_DE.UTF-8")]),
