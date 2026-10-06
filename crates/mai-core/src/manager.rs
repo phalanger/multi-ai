@@ -3,7 +3,7 @@
 //! command hosts and to open terminals. Every change comes back as an
 //! `Update` on the receiver returned by `HostManager::start`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,8 @@ fn now_ms() -> u64 {
 }
 
 enum Ctl {
-    Added(String),
+    /// A host was added; its events carry this generation.
+    Added(String, u64),
     Removed(String),
     Acknowledge(AgentKey),
 }
@@ -42,9 +43,11 @@ struct HostTasks {
 pub struct HostManager<C> {
     connector: Arc<C>,
     hosts: HashMap<String, HostTasks>,
-    events: UnboundedSender<(String, HostEvent)>,
+    events: UnboundedSender<(String, u64, HostEvent)>,
     ctl: UnboundedSender<Ctl>,
     zellij: ZellijPaths,
+    /// Bumped on every `add_host`.
+    generation: u64,
 }
 
 /// An open terminal: `zellij attach` of one session. Dropping it detaches.
@@ -80,13 +83,15 @@ impl Drop for Terminal {
 
 async fn run_monitor(
     mut monitor: Monitor,
-    mut events: UnboundedReceiver<(String, HostEvent)>,
+    mut events: UnboundedReceiver<(String, u64, HostEvent)>,
     mut ctl: UnboundedReceiver<Ctl>,
     updates: UnboundedSender<Update>,
     zellij: ZellijPaths,
 ) {
-    // Events of a removed host that were still queued are dropped.
-    let mut removed: HashSet<String> = HashSet::new();
+    // The generation of each current host. Events of a removed host, or
+    // of an earlier incarnation of a host added again with the same id
+    // (B29), are dropped.
+    let mut current: HashMap<String, u64> = HashMap::new();
     let mut ctl_open = true;
     loop {
         // Biased: a control message sent before a host event (e.g. a
@@ -98,22 +103,22 @@ async fn run_monitor(
                     ctl_open = false;
                     continue;
                 }
-                Some(Ctl::Added(id)) => {
-                    removed.remove(&id);
+                Some(Ctl::Added(id, generation)) => {
+                    current.insert(id, generation);
                     continue;
                 }
                 Some(Ctl::Removed(id)) => {
                     monitor.remove_host(&id);
                     zellij.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
-                    removed.insert(id);
+                    current.remove(&id);
                     continue;
                 }
                 Some(Ctl::Acknowledge(key)) => monitor.acknowledge(&key).into_iter().collect(),
             },
             ev = events.recv() => match ev {
                 None => return,
-                Some((id, _)) if removed.contains(&id) => continue,
-                Some((id, ev)) => {
+                Some((id, generation, _)) if current.get(&id) != Some(&generation) => continue,
+                Some((id, _, ev)) => {
                     // Terminals attach with the zellij the probe found.
                     if let HostEvent::Hello(info) = &ev {
                         let mut paths = zellij.lock().unwrap_or_else(|p| p.into_inner());
@@ -154,6 +159,7 @@ impl<C: Connector> HostManager<C> {
             events,
             ctl,
             zellij,
+            generation: 0,
         };
         (manager, updates_rx)
     }
@@ -163,23 +169,31 @@ impl<C: Connector> HostManager<C> {
         if self.hosts.contains_key(&cfg.id) {
             return false;
         }
+        self.generation += 1;
+        let generation = self.generation;
         let (probe, probe_rx) = mpsc::unbounded_channel();
         let (term, term_rx) = mpsc::unbounded_channel();
-        let _ = self.ctl.send(Ctl::Added(cfg.id.clone()));
+        let _ = self.ctl.send(Ctl::Added(cfg.id.clone(), generation));
         self.hosts.insert(cfg.id.clone(), HostTasks { probe, term });
+        // Both tasks of this host report through one channel whose events
+        // are tagged with the generation on the way to the monitor.
+        let (host_events, mut host_rx) = mpsc::unbounded_channel::<(String, HostEvent)>();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            while let Some((id, ev)) = host_rx.recv().await {
+                if events.send((id, generation, ev)).is_err() {
+                    return;
+                }
+            }
+        });
         tokio::spawn(run_terms(
             cfg.clone(),
             self.connector.clone(),
             self.zellij.clone(),
-            self.events.clone(),
+            host_events.clone(),
             term_rx,
         ));
-        tokio::spawn(run_host(
-            cfg,
-            self.connector.clone(),
-            self.events.clone(),
-            probe_rx,
-        ));
+        tokio::spawn(run_host(cfg, self.connector.clone(), host_events, probe_rx));
         true
     }
 
@@ -264,5 +278,54 @@ impl<C> Drop for HostManager<C> {
             let _ = tasks.probe.send(HostCommand::Stop);
             let _ = tasks.term.send(TermCmd::Stop);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::ConnState;
+    use std::time::Duration;
+
+    async fn next(rx: &mut UnboundedReceiver<Update>) -> Option<Update> {
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// B29: events still queued from a removed host's tasks do not reach a
+    /// host added again with the same id.
+    #[tokio::test(start_paused = true)]
+    async fn events_of_an_earlier_incarnation_are_dropped() {
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let (ctl, ctl_rx) = mpsc::unbounded_channel();
+        let (updates, mut updates_rx) = mpsc::unbounded_channel();
+        let monitor = Monitor::new(TrackerConfig::default());
+        tokio::spawn(run_monitor(
+            monitor,
+            events_rx,
+            ctl_rx,
+            updates,
+            ZellijPaths::default(),
+        ));
+        let connecting = || HostEvent::Probe(ConnState::Connecting);
+
+        ctl.send(Ctl::Added("h".into(), 1)).unwrap();
+        events.send(("h".into(), 1, connecting())).unwrap();
+        assert!(next(&mut updates_rx).await.is_some());
+
+        // Removed and added again; the old task's event arrives late.
+        ctl.send(Ctl::Removed("h".into())).unwrap();
+        ctl.send(Ctl::Added("h".into(), 2)).unwrap();
+        events.send(("h".into(), 1, connecting())).unwrap();
+        assert!(next(&mut updates_rx).await.is_none(), "stale event dropped");
+        events.send(("h".into(), 2, connecting())).unwrap();
+        assert!(next(&mut updates_rx).await.is_some());
+
+        // A removed host's events are dropped too.
+        ctl.send(Ctl::Removed("h".into())).unwrap();
+        events.send(("h".into(), 2, connecting())).unwrap();
+        assert!(next(&mut updates_rx).await.is_none());
     }
 }
