@@ -353,6 +353,15 @@ impl<C: Connector> Terms<C> {
                 if let Link::Down { error, .. } = &self.link {
                     return Some(Err(TermError::Open(error.clone())));
                 }
+                // Every terminal was closed meanwhile, so the connection went
+                // idle: connect again for this one.
+                if matches!(self.link, Link::Idle)
+                    && let Err(e) = self.connect().await?
+                {
+                    self.link = Link::Idle;
+                    self.emit(None);
+                    return Some(Err(TermError::Open(e)));
+                }
             }
             Link::Idle => match self.connect().await? {
                 Ok(()) => {}
@@ -412,7 +421,11 @@ impl<C: Connector> Terms<C> {
             at: Some(Instant::now() + retry_in),
             error: OpenError::Retry(reason.clone()),
         };
-        self.emit(Some(ConnState::Retrying { retry_in, reason }));
+        if self.slots.is_empty() {
+            self.idle_if_empty();
+        } else {
+            self.emit(Some(ConnState::Retrying { retry_in, reason }));
+        }
     }
 
     /// Reconnect and attach every terminal again; false if told to stop.
@@ -426,7 +439,11 @@ impl<C: Connector> Terms<C> {
                     at: Some(Instant::now() + retry_in),
                     error: OpenError::Retry(reason.clone()),
                 };
-                self.emit(Some(ConnState::Retrying { retry_in, reason }));
+                if self.slots.is_empty() {
+                    self.idle_if_empty();
+                } else {
+                    self.emit(Some(ConnState::Retrying { retry_in, reason }));
+                }
                 return true;
             }
             Some(Err(OpenError::NeedsUser(p))) => {
@@ -434,7 +451,11 @@ impl<C: Connector> Terms<C> {
                     at: None,
                     error: OpenError::NeedsUser(p.clone()),
                 };
-                self.emit(Some(ConnState::NeedsUser(p)));
+                if self.slots.is_empty() {
+                    self.idle_if_empty();
+                } else {
+                    self.emit(Some(ConnState::NeedsUser(p)));
+                }
                 return true;
             }
         }

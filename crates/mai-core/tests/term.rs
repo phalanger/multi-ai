@@ -595,3 +595,69 @@ async fn open_during_connect_waits_its_turn() {
     assert_eq!(h.attached().await.spec.session, "logs");
     assert_eq!(h.connector.opens.load(Ordering::SeqCst), 1);
 }
+
+/// Closing every terminal while a reconnect is failing leaves no stale
+/// problem behind: the connection goes idle and a later open works.
+#[tokio::test(start_paused = true)]
+async fn closing_every_terminal_during_a_failed_reconnect_goes_idle() {
+    let mut h = start(None, vec![]);
+    let (id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    let first = h.attached().await;
+    next(&mut rx).await;
+
+    let hold = h.connector.gate.clone().lock_owned().await;
+    h.lose_connection(first);
+    h.state().await; // Retrying
+    tokio::time::sleep(Duration::from_secs(2)).await; // reconnect is waiting
+    h.connector
+        .failures
+        .lock()
+        .unwrap()
+        .push_back(OpenError::NeedsUser(Problem::HostKeyRejected));
+    h.cmds.send(TermCmd::Close { id }).unwrap();
+    assert!(matches!(
+        next(&mut rx).await,
+        Some(TermEvent::Detached { .. })
+    ));
+    assert_eq!(next(&mut rx).await, None, "closed while reconnecting");
+    drop(hold);
+    assert_eq!(h.state().await, None, "idle, not NeedsUser");
+
+    let (_id2, _rx2) = h.open("logs").await.unwrap();
+    assert_eq!(h.state().await, Some(ConnState::Up));
+    assert_eq!(h.attached().await.spec.session, "logs");
+}
+
+/// An open that reconnects while the last other terminal is closed still
+/// attaches: the connection goes idle and is opened again for it.
+#[tokio::test(start_paused = true)]
+async fn open_after_terminals_closed_during_reconnect_attaches() {
+    let mut h = start(None, vec![]);
+    let (id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    let first = h.attached().await;
+    next(&mut rx).await;
+
+    let hold = h.connector.gate.clone().lock_owned().await;
+    h.lose_connection(first);
+    h.state().await; // Retrying
+    let second = h.request("logs"); // reconnects from open()
+    tokio::time::sleep(Duration::from_secs(1)).await; // waiting at the gate
+    h.cmds.send(TermCmd::Close { id }).unwrap();
+    assert!(matches!(
+        next(&mut rx).await,
+        Some(TermEvent::Detached { .. })
+    ));
+    assert_eq!(next(&mut rx).await, None, "closed while reconnecting");
+    drop(hold);
+    assert!(
+        second.await.unwrap().is_ok(),
+        "no false 'connection is down'"
+    );
+    assert_eq!(h.state().await, Some(ConnState::Up));
+    assert_eq!(h.state().await, None);
+    assert_eq!(h.state().await, Some(ConnState::Up));
+    assert_eq!(h.attached().await.spec.session, "logs");
+    assert!(h.attaches.try_recv().is_err());
+}
