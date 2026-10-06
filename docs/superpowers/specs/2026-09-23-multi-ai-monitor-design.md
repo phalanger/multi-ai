@@ -382,7 +382,8 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
   `<zellij> attach [--create] <session>`。zellij 路径依次取主机配置、
   探针 `Hello` 报告的路径、建立 TermConn 时在主机上查找到的路径（POSIX 主机：
   用 `sh -c` 依次查 PATH、`/opt/homebrew/bin`、`/usr/local/bin`、
-  `~/.cargo/bin`、`~/.local/bin`，最后问登录 shell；探针连不上时也能找到
+  `~/.cargo/bin`、`~/.local/bin`，最后问登录 shell，其标准输入取自
+  `/dev/null`；整个查找最多 10 秒，超时则用 PATH；探针连不上时也能找到
   非交互 SSH 的 PATH 里没有的 zellij），都没有时用 PATH 中的 `zellij`。
 - session 名为空或以 `-` 开头时拒绝打开（zellij 会把它当成选项）。
 - 远程命令必须使用 UTF-8 locale：经 SSH env 请求发送 `LANG`/`LC_CTYPE`

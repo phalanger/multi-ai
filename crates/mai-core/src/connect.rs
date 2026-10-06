@@ -20,7 +20,7 @@ use crate::ssh::client::{ConnectOptions, ExecOutput, SshError, connect};
 use crate::ssh::config::{HostSpec, config_warnings, jump_warnings, parse_config, resolve};
 use crate::stderr::{StderrTail, collect as collect_stderr};
 use crate::swap::{LocalFiles, swap_in};
-use crate::terminals::{SystemTerminals, find_zellij_command, found_zellij};
+use crate::terminals::{SystemTerminals, ZELLIJ_SEARCH_TIMEOUT, find_zellij_command, found_zellij};
 
 /// Locale requested for `serve` so zellij output is UTF-8.
 const LOCALE: &str = "en_US.UTF-8";
@@ -366,9 +366,11 @@ impl<P: Prompter, S: SecretStore> SystemConnector<P, S> {
         // Used when neither the host config nor the probe names a zellij
         // (the probe may be down); a failed search just leaves PATH.
         let found = if remote.shell == Shell::Posix {
-            match session.exec(&find_zellij_command()).await {
-                Ok(out) => found_zellij(&out.stdout_str()),
-                Err(_) => None,
+            match tokio::time::timeout(ZELLIJ_SEARCH_TIMEOUT, session.exec(&find_zellij_command()))
+                .await
+            {
+                Ok(Ok(out)) => found_zellij(&out.stdout_str()),
+                _ => None,
             }
         } else {
             None

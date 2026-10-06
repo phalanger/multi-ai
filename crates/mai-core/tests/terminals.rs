@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use mai_core::terminals::{
-    find_zellij_command, find_zellij_script, found_zellij, local_env_with, FALLBACK_LOCALE,
-    ZELLIJ_DIRS,
+    FALLBACK_LOCALE, ZELLIJ_DIRS, ZELLIJ_SEARCH_TIMEOUT, find_zellij_command, find_zellij_script,
+    found_zellij, local_env_with,
 };
 
 #[test]
@@ -17,7 +17,10 @@ fn search_script_covers_path_dirs_and_login_shell() {
             .contains("/opt/homebrew/bin /usr/local/bin \"$HOME/.cargo/bin\" \"$HOME/.local/bin\""),
         "{script}"
     );
-    assert!(script.ends_with("-lc \"command -v zellij\""), "{script}");
+    assert!(
+        script.ends_with("-lc \"command -v zellij\" </dev/null"),
+        "{script}"
+    );
     assert!(
         !script.contains('\''),
         "the script is wrapped in single quotes"
@@ -25,6 +28,7 @@ fn search_script_covers_path_dirs_and_login_shell() {
     assert!(!script.contains('!'), "csh history expansion");
     assert_eq!(find_zellij_command(), format!("sh -c '{script}'"));
     assert_eq!(ZELLIJ_DIRS.len(), 4);
+    assert_eq!(ZELLIJ_SEARCH_TIMEOUT, std::time::Duration::from_secs(10));
 }
 
 #[test]

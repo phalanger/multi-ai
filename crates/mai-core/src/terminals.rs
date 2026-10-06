@@ -3,13 +3,14 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::deploy::Remote;
 use crate::host::{OpenError, Problem};
-use crate::pty::{spawn_local, PtyIo};
+use crate::pty::{PtyIo, spawn_local};
 use crate::ssh::auth::Prompter;
 use crate::ssh::client::SshSession;
-use crate::term::{attach_argv, remote_attach_command, AttachSpec, TermTransport, LOCALE_ENV};
+use crate::term::{AttachSpec, LOCALE_ENV, TermTransport, attach_argv, remote_attach_command};
 
 /// Terminal connection of one host.
 pub enum SystemTerminals<P: Prompter> {
@@ -34,10 +35,15 @@ pub const ZELLIJ_DIRS: [&str; 4] = [
     "~/.local/bin",
 ];
 
+/// How long the zellij search may take while the host lock is held.
+pub const ZELLIJ_SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// POSIX `sh` script that prints where zellij is: PATH, then
 /// `ZELLIJ_DIRS`, then the user's login shell (whose profile may extend
 /// PATH). Non-interactive SSH sessions often lack the directories a
-/// package manager adds (e.g. `/opt/homebrew/bin` on macOS).
+/// package manager adds (e.g. `/opt/homebrew/bin` on macOS). The login
+/// shell reads stdin from `/dev/null`, so a profile that reads input
+/// cannot block on the open exec channel.
 pub fn find_zellij_script() -> String {
     let dirs: Vec<String> = ZELLIJ_DIRS
         .iter()
@@ -47,7 +53,7 @@ pub fn find_zellij_script() -> String {
         })
         .collect();
     format!(
-        "command -v zellij || for d in {}; do if [ -x \"$d/zellij\" ]; then echo \"$d/zellij\"; exit 0; fi; done; exec \"${{SHELL:-sh}}\" -lc \"command -v zellij\"",
+        "command -v zellij || for d in {}; do if [ -x \"$d/zellij\" ]; then echo \"$d/zellij\"; exit 0; fi; done; exec \"${{SHELL:-sh}}\" -lc \"command -v zellij\" </dev/null",
         dirs.join(" ")
     )
 }
