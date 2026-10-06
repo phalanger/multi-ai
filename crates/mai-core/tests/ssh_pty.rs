@@ -18,9 +18,19 @@ use tokio::time::timeout;
 
 type Log = Arc<Mutex<Vec<String>>>;
 
+/// How the server answers `env` requests.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Env {
+    Accept,
+    Refuse,
+    /// Never answers.
+    Silent,
+}
+
 #[derive(Clone)]
 struct PtyServer {
-    accept_env: bool,
+    env: Env,
+    refuse_pty: bool,
     log: Log,
 }
 
@@ -59,7 +69,11 @@ impl server::Handler for PtyServer {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.note(format!("pty {term} {cols}x{rows}"));
-        session.channel_success(channel)
+        if self.refuse_pty {
+            session.channel_failure(channel)
+        } else {
+            session.channel_success(channel)
+        }
     }
 
     async fn env_request(
@@ -69,12 +83,23 @@ impl server::Handler for PtyServer {
         value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.accept_env {
-            self.note(format!("env {name}={value}"));
-            session.channel_success(channel)
-        } else {
-            session.channel_failure(channel)
+        match self.env {
+            Env::Accept => {
+                self.note(format!("env {name}={value}"));
+                session.channel_success(channel)
+            }
+            Env::Refuse => session.channel_failure(channel),
+            Env::Silent => Ok(()),
         }
+    }
+
+    async fn channel_close(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.note("close".into());
+        Ok(())
     }
 
     async fn exec_request(
@@ -84,6 +109,10 @@ impl server::Handler for PtyServer {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         self.note(format!("exec {}", String::from_utf8_lossy(data)));
+        if data == b"early" {
+            // Output that arrives before the answer to the request.
+            session.data(channel, b"early output\r\n".to_vec())?;
+        }
         session.channel_success(channel)?;
         if data == b"two-streams" {
             session.data(channel, b"out-1\n".to_vec())?;
@@ -186,9 +215,18 @@ impl SecretStore for NoSecrets {
 }
 
 async fn session(accept_env: bool) -> (SshSession<Trusting>, Log, tempfile::TempDir) {
+    let env = if accept_env { Env::Accept } else { Env::Refuse };
+    session_with(env, false).await
+}
+
+async fn session_with(
+    env: Env,
+    refuse_pty: bool,
+) -> (SshSession<Trusting>, Log, tempfile::TempDir) {
     let log = Log::default();
     let port = start(PtyServer {
-        accept_env,
+        env,
+        refuse_pty,
         log: log.clone(),
     })
     .await;
@@ -296,6 +334,52 @@ async fn channel_closed_without_exit_status_is_a_lost_connection() {
     read_until(&mut io, "ready").await;
     io.input.send(PtyIn::Data(b"drop".to_vec())).unwrap();
     assert_eq!(end(&mut io).await, None, "no Exit: the connection was lost");
+}
+
+/// Wait until the server has seen the channel close.
+async fn closed(log: &Log) {
+    timeout(Duration::from_secs(10), async {
+        while !log.lock().unwrap().iter().any(|l| l == "close") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("channel closed on the server");
+}
+
+#[tokio::test]
+async fn refused_pty_closes_the_channel() {
+    let (s, log, _dir) = session_with(Env::Accept, true).await;
+    let size = TermSize { cols: 80, rows: 24 };
+    let err = s.open_pty(size, &ENV, command).await.err().unwrap();
+    assert!(err.to_string().contains("refused the pty"), "{err}");
+    closed(&log).await;
+}
+
+/// A server that never answers fails the setup (instead of taking a late
+/// answer for the next request's) and the channel is closed.
+#[tokio::test]
+async fn unanswered_request_fails_and_closes_the_channel() {
+    let (s, log, _dir) = session_with(Env::Silent, false).await;
+    let size = TermSize { cols: 80, rows: 24 };
+    let err = s.open_pty(size, &ENV, command).await.err().unwrap();
+    assert!(
+        err.to_string().contains("no answer to the env request"),
+        "{err}"
+    );
+    closed(&log).await;
+    assert!(
+        !log.lock().unwrap().iter().any(|l| l.starts_with("exec")),
+        "no command after an unanswered request"
+    );
+}
+
+#[tokio::test]
+async fn output_before_the_command_is_accepted_is_kept() {
+    let (s, _log, _dir) = session(true).await;
+    let size = TermSize { cols: 80, rows: 24 };
+    let mut io = s.open_pty(size, &ENV, |_| "early".into()).await.unwrap();
+    read_until(&mut io, "early output").await;
 }
 
 #[tokio::test]

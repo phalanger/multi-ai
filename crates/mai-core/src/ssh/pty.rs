@@ -17,14 +17,23 @@ fn chan_err(e: impl std::fmt::Display) -> SshError {
     SshError::Channel(e.to_string())
 }
 
-/// The server's answer to the last request: `Some(true)` accepted,
-/// `Some(false)` refused, `None` no answer in time.
-async fn reply(read: &mut ChannelReadHalf) -> Result<Option<bool>, SshError> {
+/// The server's answer to the last request: `true` accepted, `false`
+/// refused. Output that arrives first is kept in `early`. No answer in
+/// time is an error: a late answer would otherwise be taken for the answer
+/// to the next request.
+async fn reply(
+    read: &mut ChannelReadHalf,
+    early: &mut Vec<u8>,
+    what: &str,
+) -> Result<bool, SshError> {
     let wait = async {
         loop {
             match read.wait().await {
                 Some(ChannelMsg::Success) => return Ok(true),
                 Some(ChannelMsg::Failure) => return Ok(false),
+                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    early.extend_from_slice(&data);
+                }
                 Some(ChannelMsg::Close) | None => {
                     return Err(SshError::Channel("channel closed".into()));
                 }
@@ -33,15 +42,52 @@ async fn reply(read: &mut ChannelReadHalf) -> Result<Option<bool>, SshError> {
         }
     };
     match tokio::time::timeout(REPLY_TIMEOUT, wait).await {
-        Ok(r) => r.map(Some),
-        Err(_) => Ok(None),
+        Ok(r) => r,
+        Err(_) => Err(SshError::Channel(format!(
+            "no answer to the {what} request within {}s",
+            REPLY_TIMEOUT.as_secs()
+        ))),
     }
+}
+
+/// Request the PTY, the variables and the command; output seen before the
+/// command was accepted is returned.
+async fn setup(
+    read: &mut ChannelReadHalf,
+    write: &Writer,
+    size: TermSize,
+    env: &[(&str, &str)],
+    command: impl FnOnce(bool) -> String,
+) -> Result<Vec<u8>, SshError> {
+    let mut early = Vec::new();
+    let (cols, rows) = (u32::from(size.cols), u32::from(size.rows));
+    write
+        .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
+        .await
+        .map_err(chan_err)?;
+    if !reply(read, &mut early, "pty").await? {
+        return Err(SshError::Channel("server refused the pty request".into()));
+    }
+    let mut accepted = true;
+    for (k, v) in env {
+        write.set_env(true, *k, *v).await.map_err(chan_err)?;
+        accepted &= reply(read, &mut early, "env").await?;
+    }
+    write
+        .exec(true, command(accepted))
+        .await
+        .map_err(chan_err)?;
+    if !reply(read, &mut early, "exec").await? {
+        return Err(SshError::Channel("server refused the command".into()));
+    }
+    Ok(early)
 }
 
 /// Request a PTY of `size` and the variables in `env` on `ch`, then run
 /// `command(env_accepted)`, where `env_accepted` says whether the server
 /// accepted every variable (so the caller can fall back to a command
-/// prefix). The returned `PtyIo` is driven by a spawned task.
+/// prefix). The returned `PtyIo` is driven by a spawned task. If setting
+/// up fails, the channel is closed.
 pub(crate) async fn start(
     ch: Channel<client::Msg>,
     size: TermSize,
@@ -49,27 +95,17 @@ pub(crate) async fn start(
     command: impl FnOnce(bool) -> String,
 ) -> Result<PtyIo, SshError> {
     let (mut read, write) = ch.split();
-    let (cols, rows) = (u32::from(size.cols), u32::from(size.rows));
-    write
-        .request_pty(true, "xterm-256color", cols, rows, 0, 0, &[])
-        .await
-        .map_err(chan_err)?;
-    if reply(&mut read).await? != Some(true) {
-        return Err(SshError::Channel("server refused the pty request".into()));
-    }
-    let mut accepted = true;
-    for (k, v) in env {
-        write.set_env(true, *k, *v).await.map_err(chan_err)?;
-        accepted &= reply(&mut read).await? == Some(true);
-    }
-    write
-        .exec(true, command(accepted))
-        .await
-        .map_err(chan_err)?;
-    if reply(&mut read).await? == Some(false) {
-        return Err(SshError::Channel("server refused the command".into()));
-    }
+    let early = match setup(&mut read, &write, size, env, command).await {
+        Ok(early) => early,
+        Err(e) => {
+            let _ = write.close().await;
+            return Err(e);
+        }
+    };
     let (io, ends) = pty_channels();
+    if !early.is_empty() {
+        let _ = ends.output.send(PtyOut::Data(early));
+    }
     tokio::spawn(pump(read, write, ends));
     Ok(io)
 }
