@@ -34,6 +34,9 @@ pub struct ConnectOptions {
     pub learn_to: PathBuf,
     /// TCP connect + key exchange timeout per hop.
     pub timeout: Duration,
+    /// Offer the keys of the running ssh-agent (or Pageant on Windows).
+    /// Tests turn this off so they never reach the developer's agent.
+    pub use_agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

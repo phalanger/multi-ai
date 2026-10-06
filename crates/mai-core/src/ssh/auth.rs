@@ -86,6 +86,12 @@ pub fn passphrase_key(key_file: &Path) -> String {
     format!("passphrase:{text}")
 }
 
+/// The key passphrases were stored under before paths were canonicalized
+/// (the path as written). Looked up once and moved to `passphrase_key`.
+pub fn legacy_passphrase_key(key_file: &Path) -> String {
+    format!("passphrase:{}", key_file.display())
+}
+
 const KEYRING_SERVICE: &str = "multi-ai";
 
 /// macOS Keychain / Windows Credential Manager / Secret Service.

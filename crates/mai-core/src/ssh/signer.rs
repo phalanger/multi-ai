@@ -13,7 +13,7 @@ use russh::keys::ssh_key::public::KeyData;
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
 use signature::Signer as _;
 
-use super::auth::{Prompter, SecretStore, passphrase_key};
+use super::auth::{Prompter, SecretStore, legacy_passphrase_key, passphrase_key};
 
 /// The public half of a key file without decrypting it: `<file>.pub` if
 /// present, else the public key stored in an OpenSSH private key file
@@ -44,6 +44,9 @@ pub async fn load_key<P: Prompter, S: SecretStore>(
         Err(_) => return None,
     }
     let key = passphrase_key(path);
+    if let Some(k) = migrate_passphrase(path, &key, secrets, notes) {
+        return Some(k);
+    }
     if let Some(pass) = secrets.get(&key) {
         if let Ok(k) = russh::keys::load_secret_key(path, Some(&pass)) {
             return Some(k);
@@ -66,6 +69,38 @@ pub async fn load_key<P: Prompter, S: SecretStore>(
         ));
     }
     Some(k)
+}
+
+/// A passphrase remembered under the old key (`legacy_passphrase_key`)
+/// and nothing under the current one: decrypt with it, move it to the
+/// current key and remove the old entry. Returns the key if that worked.
+fn migrate_passphrase<S: SecretStore>(
+    path: &Path,
+    key: &str,
+    secrets: &S,
+    notes: &mut Vec<String>,
+) -> Option<PrivateKey> {
+    let legacy = legacy_passphrase_key(path);
+    if legacy == key || secrets.get(key).is_some() {
+        return None;
+    }
+    let pass = secrets.get(&legacy)?;
+    let decrypted = russh::keys::load_secret_key(path, Some(&pass)).ok();
+    if decrypted.is_some()
+        && let Err(e) = secrets.set(key, &pass)
+    {
+        notes.push(format!(
+            "could not save the passphrase of {} in the keychain: {e}",
+            path.display()
+        ));
+    }
+    if let Err(e) = secrets.delete(&legacy) {
+        notes.push(format!(
+            "could not remove the old passphrase entry of {} from the keychain: {e}",
+            path.display()
+        ));
+    }
+    decrypted
 }
 
 /// `to_sign` followed by the SSH signature of `to_sign` (an SSH string
@@ -110,9 +145,18 @@ pub fn bogus_signed(public: &PublicKey, hash_alg: Option<HashAlg>, to_sign: &[u8
     out
 }
 
-/// Error type the russh `Signer` trait requires; never produced here.
+/// Error type the russh `Signer` trait requires: russh raises it when the
+/// session it would send the request on has gone away.
 #[derive(Debug)]
 pub struct SignError;
+
+impl std::fmt::Display for SignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the SSH session closed during public key authentication")
+    }
+}
+
+impl std::error::Error for SignError {}
 
 impl From<russh::SendError> for SignError {
     fn from(_: russh::SendError) -> Self {

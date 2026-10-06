@@ -236,6 +236,7 @@ async fn session_with(
         known_hosts: vec![learn_to.clone()],
         learn_to,
         timeout: Duration::from_secs(10),
+        use_agent: false,
     };
     let spec = HostSpec {
         alias: "pty".into(),

@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mai_core::ssh::auth::{KbdPrompt, Prompter, Secret, SecretStore, passphrase_key, password_key};
+use mai_core::ssh::auth::{
+    KbdPrompt, Prompter, Secret, SecretStore, legacy_passphrase_key, passphrase_key, password_key,
+};
 use mai_core::ssh::client::{ConnectOptions, SshError, connect};
 use mai_core::ssh::config::HostSpec;
-use mai_core::ssh::signer::FileSigner;
+use mai_core::ssh::signer::{FileSigner, SignError, load_key};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
@@ -271,6 +273,7 @@ fn opts(dir: &Path) -> ConnectOptions {
         known_hosts: vec![learn_to.clone()],
         learn_to,
         timeout: Duration::from_secs(10),
+        use_agent: false,
     }
 }
 
@@ -329,6 +332,7 @@ async fn learn_to_is_checked_even_if_absent_from_known_hosts() {
         known_hosts: vec![dir.path().join("does_not_exist")],
         learn_to: dir.path().join("app_known_hosts"),
         timeout: Duration::from_secs(10),
+        use_agent: false,
     };
     let p = Arc::new(Scripted {
         trust: true,
@@ -888,4 +892,59 @@ async fn file_signer_is_not_declined_with_the_right_passphrase() {
     let (out, declined) = sign_with(secret("pw", false)).await;
     assert!(out.len() > b"data".len());
     assert!(!declined);
+}
+
+/// An encrypted key file reached through a `sub/..` detour, so the path as
+/// written differs from its canonical form.
+fn detoured_encrypted_key(dir: &Path) -> PathBuf {
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    random_key()
+        .encrypt(&mut SysRng, "pw")
+        .unwrap()
+        .write_openssh_file(dir.join("id_enc"), LineEnding::LF)
+        .unwrap();
+    dir.join("sub").join("..").join("id_enc")
+}
+
+/// B39: a passphrase remembered before keys were canonicalized is used
+/// without asking, then moved to the current key.
+#[tokio::test]
+async fn passphrase_under_the_old_key_is_moved_to_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = detoured_encrypted_key(dir.path());
+    let (old, new) = (legacy_passphrase_key(&key_file), passphrase_key(&key_file));
+    assert_ne!(old, new);
+    let store = MemStore::default();
+    store.set(&old, "pw").unwrap();
+    let p = Scripted::default();
+    let mut notes = Vec::new();
+    assert!(load_key(&key_file, &p, &store, &mut notes).await.is_some());
+    assert!(p.calls().is_empty(), "not asked: {:?}", p.calls());
+    assert_eq!(store.get(&new).as_deref(), Some("pw"));
+    assert_eq!(store.get(&old), None, "old entry removed");
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+#[tokio::test]
+async fn wrong_passphrase_under_the_old_key_is_removed_and_the_user_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = detoured_encrypted_key(dir.path());
+    let old = legacy_passphrase_key(&key_file);
+    let store = MemStore::default();
+    store.set(&old, "stale").unwrap();
+    let p = Scripted {
+        passphrase: secret("pw", false),
+        ..Default::default()
+    };
+    let mut notes = Vec::new();
+    assert!(load_key(&key_file, &p, &store, &mut notes).await.is_some());
+    assert_eq!(p.calls(), vec!["passphrase"]);
+    assert_eq!(store.get(&old), None);
+}
+
+/// B40: the signer's error reads as a sentence, not a debug dump.
+#[test]
+fn sign_error_explains_itself() {
+    let msg = SignError.to_string();
+    assert!(msg.contains("session closed"), "{msg}");
 }

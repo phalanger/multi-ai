@@ -140,6 +140,7 @@ pub fn options() -> ConnectOptions {
         known_hosts,
         learn_to,
         timeout: Duration::from_secs(20),
+        use_agent: true,
     }
 }
 
