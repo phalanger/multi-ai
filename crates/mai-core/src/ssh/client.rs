@@ -381,7 +381,15 @@ async fn connect_hop<P: Prompter, S: SecretStore>(
         Ok(h) => h,
     };
     let mut notes = via.as_ref().map(|v| v.notes.clone()).unwrap_or_default();
-    authenticate(&mut handle, hop, prompter.as_ref(), secrets, &mut notes).await?;
+    authenticate(
+        &mut handle,
+        hop,
+        prompter.as_ref(),
+        secrets,
+        opts.use_agent,
+        &mut notes,
+    )
+    .await?;
     Ok(SshSession {
         handle,
         _via: via.map(Box::new),
@@ -426,6 +434,7 @@ async fn authenticate<P: Prompter, S: SecretStore>(
     spec: &HostSpec,
     prompter: &P,
     secrets: &S,
+    use_agent: bool,
     notes: &mut Vec<String>,
 ) -> Result<(), SshError> {
     let user = spec.user.as_str();
@@ -489,9 +498,8 @@ async fn authenticate<P: Prompter, S: SecretStore>(
                 Step::Failed => {}
             }
         }
-        match try_agent(h, user, &tried, &mut methods).await? {
-            Step::Done => return Ok(()),
-            Step::Partial | Step::Failed => {}
+        if use_agent && try_agent(h, user, &tried, &mut methods).await? == Step::Done {
+            return Ok(());
         }
     }
 
