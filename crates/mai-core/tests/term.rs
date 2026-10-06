@@ -348,65 +348,6 @@ async fn lost_connection_detaches_then_reattaches_with_current_size() {
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn closing_the_last_terminal_detaches_and_closes_the_connection() {
-    let mut h = start(None, vec![]);
-    let (id, mut rx) = h.open("work").await.unwrap();
-    h.state().await;
-    let mut pty = h.attached().await;
-    h.cmds.send(TermCmd::Close { id }).unwrap();
-    assert_eq!(pty.ends.input.recv().await, Some(PtyIn::Close));
-    assert_eq!(h.state().await, None);
-    assert_eq!(next(&mut rx).await, Some(TermEvent::Attached));
-    assert_eq!(next(&mut rx).await, None);
-}
-
-#[tokio::test(start_paused = true)]
-async fn failed_open_is_reported_to_the_caller() {
-    let mut h = start(
-        None,
-        vec![OpenError::NeedsUser(Problem::Auth("denied".into()))],
-    );
-    let r = h.open("work").await;
-    assert_eq!(
-        r.err(),
-        Some(TermError::Open(OpenError::NeedsUser(Problem::Auth(
-            "denied".into()
-        ))))
-    );
-    assert_eq!(h.state().await, None);
-    assert!(h.open("work").await.is_ok(), "next open tries again");
-}
-
-#[tokio::test(start_paused = true)]
-async fn reconnect_needing_the_user_waits_for_retry() {
-    let mut h = start(None, vec![]);
-    let (_id, mut rx) = h.open("work").await.unwrap();
-    h.state().await;
-    let first = h.attached().await;
-    next(&mut rx).await;
-    h.connector
-        .failures
-        .lock()
-        .unwrap()
-        .push_back(OpenError::NeedsUser(Problem::HostKeyRejected));
-    h.lose_connection(first);
-    assert!(matches!(h.state().await, Some(ConnState::Retrying { .. })));
-    assert_eq!(
-        h.state().await,
-        Some(ConnState::NeedsUser(Problem::HostKeyRejected))
-    );
-    tokio::time::sleep(Duration::from_secs(3600)).await;
-    assert_eq!(
-        h.connector.opens.load(Ordering::SeqCst),
-        2,
-        "no automatic retry"
-    );
-    h.cmds.send(TermCmd::Retry).unwrap();
-    assert_eq!(h.state().await, Some(ConnState::Up));
-    h.attached().await;
-}
-
 /// B27: one terminal's channel closing while the connection is fine
 /// reattaches that terminal only, over the same connection.
 #[tokio::test(start_paused = true)]
@@ -480,6 +421,65 @@ async fn backoff_starts_over_only_after_a_stable_connection() {
     tokio::time::sleep(STABLE_AFTER).await;
     h.lose_connection(pty);
     assert_eq!(retry_in(h.state().await), Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn closing_the_last_terminal_detaches_and_closes_the_connection() {
+    let mut h = start(None, vec![]);
+    let (id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    let mut pty = h.attached().await;
+    h.cmds.send(TermCmd::Close { id }).unwrap();
+    assert_eq!(pty.ends.input.recv().await, Some(PtyIn::Close));
+    assert_eq!(h.state().await, None);
+    assert_eq!(next(&mut rx).await, Some(TermEvent::Attached));
+    assert_eq!(next(&mut rx).await, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_open_is_reported_to_the_caller() {
+    let mut h = start(
+        None,
+        vec![OpenError::NeedsUser(Problem::Auth("denied".into()))],
+    );
+    let r = h.open("work").await;
+    assert_eq!(
+        r.err(),
+        Some(TermError::Open(OpenError::NeedsUser(Problem::Auth(
+            "denied".into()
+        ))))
+    );
+    assert_eq!(h.state().await, None);
+    assert!(h.open("work").await.is_ok(), "next open tries again");
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_needing_the_user_waits_for_retry() {
+    let mut h = start(None, vec![]);
+    let (_id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    let first = h.attached().await;
+    next(&mut rx).await;
+    h.connector
+        .failures
+        .lock()
+        .unwrap()
+        .push_back(OpenError::NeedsUser(Problem::HostKeyRejected));
+    h.lose_connection(first);
+    assert!(matches!(h.state().await, Some(ConnState::Retrying { .. })));
+    assert_eq!(
+        h.state().await,
+        Some(ConnState::NeedsUser(Problem::HostKeyRejected))
+    );
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(
+        h.connector.opens.load(Ordering::SeqCst),
+        2,
+        "no automatic retry"
+    );
+    h.cmds.send(TermCmd::Retry).unwrap();
+    assert_eq!(h.state().await, Some(ConnState::Up));
+    h.attached().await;
 }
 
 /// B27: opening a terminal while the connection is down reports why it is
