@@ -32,10 +32,12 @@ cargo clippy --workspace --all-targets -- -D warnings
   Host keys are checked against known_hosts (hashed names, globs, `@revoked`);
   unknown keys are confirmed through `Prompter`, changed or revoked keys are
   refused.
+  `ConnectOptions::use_agent` turns the ssh-agent step off (tests do).
 - `deploy::deploy` uploads the matching probe (skipped when SHA-256 matches),
   checks the uploaded file's SHA-256 on the host, swaps it in by moving the
   old binary aside (`swap::swap_in`, works while it runs on Windows) and runs
-  `install-hooks`.
+  `install-hooks`. Upload timeouts on slow links are retried like other
+  network errors.
 - `manager::HostManager` runs one task per host (`host::run_host`): connect,
   deploy, start `serve`, relay messages, reconnect with backoff (1 s doubling
   to 60 s). Problems that need the user (authentication, host keys, deploy,
@@ -47,7 +49,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 - `HostManager::open_terminal` attaches a terminal to a zellij session
   (`zellij attach [--create]`) in a PTY: over a per-host terminal SSH
   connection, or a local PTY (ConPTY on Windows). If the connection drops,
-  terminals get `Detached` and are reattached automatically.
+  terminals get `Detached` and are reattached automatically; a single closed
+  channel reattaches only that terminal. Session names that are empty or
+  start with `-` are refused. Without a zellij path from the host config or
+  the probe, zellij is searched for on the host (PATH, common install dirs,
+  login shell).
 
 Manual checks (prompts on the terminal, secrets kept in memory):
 

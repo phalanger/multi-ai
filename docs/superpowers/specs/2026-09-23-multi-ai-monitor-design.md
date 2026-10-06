@@ -124,7 +124,7 @@ stdin/stdout 通信；本机不需要 sshd。
 服务名 `multi-ai`，键为 `<host>/password` 与 `passphrase:<私钥路径>`；私钥路径先
 规范化（`canonicalize`；Windows 上去掉 `\\?\` 前缀并转为小写），同一私钥的不同
 写法共用一个键。旧版本按原样路径保存的口令（`passphrase:<写法>`）在新键下没有
-条目时被读出：能解密则移到新键，并删除旧条目；不能解密也删除旧条目。
+条目时被读出：能解密则移到新键，并删除旧条目（保存到新键失败时保留旧条目）；不能解密也删除旧条目。
 钥匙串写入或删除失败不中断认证，但作为提示交给 UI（见第 11 节）。
 
 ### 3.3 主机密钥校验
@@ -214,7 +214,7 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
 
    SFTP 路径相对登录目录（`.mai/bin/...`）；内置二进制来自 CI 产物 `probes/<target>/`。
    每个 SFTP 请求最多等 60 秒（russh-sftp 默认 10 秒，慢链路上写探针会超时）；
-   上传超时按网络错误自动重试，其他上传失败等待用户处理。
+   上传超时按网络错误自动重试（上传中途 SSH 连接断开同样自动重试），其他上传失败等待用户处理。
    SFTP 不可用时回退 exec 写入尚未实现，见
    `docs/superpowers/plans/2026-09-24-02-followups.md`（B18）。
 4. 执行 `mai-probe install-hooks`（幂等）。
@@ -395,8 +395,9 @@ hook 条目以探针路径 `.mai/bin/mai-probe` 识别为本应用所有。因�
   `@xterm/addon-unicode11`（宽字符宽度与 zellij 一致）。
 - 本机：portable-pty 执行同样命令，环境加 `TERM=xterm-256color`；非 Windows
   且环境里没有 UTF-8 locale（依次看 `LC_ALL`、`LC_CTYPE`、`LANG`）时再加
-  `LANG`/`LC_CTYPE`（Linux 为 `C.UTF-8`，macOS 为 `en_US.UTF-8`），用户自己的
-  UTF-8 locale（如 `zh_CN.UTF-8`）保持不变。zellij 不在 PATH 中时，同样查找
+  `LANG`/`LC_CTYPE`（Linux 为 `C.UTF-8`，macOS 为 `en_US.UTF-8`）；环境里设了
+  非 UTF-8 的 `LC_ALL` 时同样改为该 locale（否则继承的 `LC_ALL` 会覆盖前两者），
+  用户自己的 UTF-8 locale（如 `zh_CN.UTF-8`）保持不变。zellij 不在 PATH 中时，同样查找
   上述常见安装目录。ConPTY 启动时发出光标位置查询
   （`ESC[6n`）并等待答复，由 xterm.js 应答；应用不代为应答，以免答复两次。
 - 窗口尺寸变化同步到 PTY（window-change）。
@@ -485,7 +486,7 @@ attach 同一 session 并有输入，跳转会作用到那个终端。
   `Update::Notes`，在 `Hello`、`Hooks` 之后发出，没有提示时不发。多跳连接的
   提示合并在一起。连接失败时提示不会丢失：附加在失败原因的文本之后
   （`Retry` 的原因，以及认证、部署、配置问题的文本；主机密钥与协议问题没有文本，
-  不附加）。
+  不附加；认证失败时，认证过程中产生的钥匙串提示同样附加）。
 
 ## 12. 测试策略
 
