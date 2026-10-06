@@ -473,7 +473,7 @@ async fn authenticate<P: Prompter, S: SecretStore>(
                         .await
                     {
                         Ok(r) => r,
-                        Err(e) => return Err(SshError::Connect(format!("{e:?}"))),
+                        Err(e) => return Err(connect_err(e)),
                     };
                     // A declined passphrase leaves the key to the agent.
                     if !signer.declined {

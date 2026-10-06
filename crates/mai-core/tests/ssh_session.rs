@@ -948,3 +948,35 @@ fn sign_error_explains_itself() {
     let msg = SignError.to_string();
     assert!(msg.contains("session closed"), "{msg}");
 }
+
+/// A keychain that can read what it holds but refuses every write.
+struct NoSaveStore(HashMap<String, String>);
+
+impl SecretStore for NoSaveStore {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
+    }
+    fn set(&self, _key: &str, _value: &str) -> Result<(), String> {
+        Err("keychain locked".into())
+    }
+    fn delete(&self, _key: &str) -> Result<(), String> {
+        panic!("the old entry must be kept when saving failed");
+    }
+}
+
+#[tokio::test]
+async fn old_passphrase_entry_is_kept_if_saving_it_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = detoured_encrypted_key(dir.path());
+    let old = legacy_passphrase_key(&key_file);
+    let store = NoSaveStore(HashMap::from([(old.clone(), "pw".to_owned())]));
+    let p = Scripted::default();
+    let mut notes = Vec::new();
+    assert!(load_key(&key_file, &p, &store, &mut notes).await.is_some());
+    assert!(p.calls().is_empty(), "not asked: {:?}", p.calls());
+    assert!(
+        notes.iter().any(|n| n.contains("could not save")),
+        "{notes:?}"
+    );
+    assert_eq!(store.get(&old).as_deref(), Some("pw"), "old entry kept");
+}

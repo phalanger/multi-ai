@@ -89,10 +89,12 @@ fn migrate_passphrase<S: SecretStore>(
     if decrypted.is_some()
         && let Err(e) = secrets.set(key, &pass)
     {
+        // Keep the old entry: it is the only copy of a working passphrase.
         notes.push(format!(
             "could not save the passphrase of {} in the keychain: {e}",
             path.display()
         ));
+        return decrypted;
     }
     if let Err(e) = secrets.delete(&legacy) {
         notes.push(format!(
