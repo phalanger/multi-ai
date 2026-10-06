@@ -14,7 +14,9 @@ use tokio::sync::oneshot;
 use crate::host::{Connector, HostCommand, HostConfig, HostEvent, run_host};
 use crate::monitor::{Monitor, Update};
 use crate::pty::TermSize;
-use crate::term::{AttachSpec, TermCmd, TermError, TermEvent, ZellijPaths, run_terms};
+use crate::term::{
+    AttachSpec, TermCmd, TermError, TermEvent, ZellijPaths, check_session, run_terms,
+};
 use crate::tracker::{AgentKey, TrackerConfig};
 
 fn now_ms() -> u64 {
@@ -226,6 +228,7 @@ impl<C: Connector> HostManager<C> {
         create: bool,
         size: TermSize,
     ) -> Result<Terminal, TermError> {
+        check_session(session)?;
         let tasks = self.hosts.get(host).ok_or(TermError::NoHost)?;
         let (reply, answer) = oneshot::channel();
         let spec = AttachSpec {

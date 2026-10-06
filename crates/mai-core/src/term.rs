@@ -5,9 +5,11 @@
 //! connection is opened with the first terminal and closed with the last.
 //! When it is lost, every terminal is told it is detached, the task
 //! reconnects with backoff and attaches each terminal again (zellij keeps
-//! the session, so the user continues where they were).
+//! the session, so the user continues where they were). While connecting
+//! or attaching, the task keeps handling input, resizes, closes and stop;
+//! further opens wait their turn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -17,12 +19,16 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::deploy::{Remote, Shell};
-use crate::host::{Backoff, ConnState, Connector, HostConfig, HostEvent, OpenError};
+use crate::host::{Backoff, ConnState, Connector, HostConfig, HostEvent, OpenError, STABLE_AFTER};
 use crate::pty::{PtyIn, PtyIo, PtyOut, TermSize};
 
 /// Locale requested for terminals (design 7): without it zellij sessions
 /// created over SSH on macOS run in the C locale and CJK input breaks.
 pub const LOCALE_ENV: [(&str, &str); 2] = [("LANG", "en_US.UTF-8"), ("LC_CTYPE", "en_US.UTF-8")];
+
+/// A terminal whose channel keeps closing soon after attaching is given up
+/// on after this many such closes in a row.
+pub const MAX_QUICK_ENDS: u32 = 3;
 
 /// Arguments after the zellij binary: `attach [--create] <session>`.
 pub fn attach_argv(session: &str, create: bool) -> Vec<String> {
@@ -73,6 +79,11 @@ pub trait TermTransport: Send + 'static {
         zellij: Option<&str>,
         spec: &AttachSpec,
     ) -> impl Future<Output = Result<PtyIo, OpenError>> + Send;
+
+    /// Whether the connection itself is still up. When one terminal's
+    /// output ends without an exit status, this tells a closed channel
+    /// (reattach that terminal) from a lost connection (reattach all).
+    fn alive(&self) -> bool;
 }
 
 /// Sent to the owner of a terminal.
@@ -81,12 +92,14 @@ pub enum TermEvent {
     Output(Vec<u8>),
     /// Attached (again): zellij redraws the whole screen.
     Attached,
-    /// The connection was lost; the terminal is reattached when it is back.
+    /// The connection (or this terminal's channel) was lost; the terminal
+    /// is reattached when possible.
     Detached {
         reason: String,
     },
-    /// `zellij attach` exited (the user detached or quit the session).
-    /// The terminal is finished.
+    /// `zellij attach` exited (the user detached or quit the session), or
+    /// its channel kept closing right after attaching. The terminal is
+    /// finished.
     Exited(Option<u32>),
 }
 
@@ -94,6 +107,9 @@ pub enum TermEvent {
 pub enum TermError {
     /// No host with this id.
     NoHost,
+    /// The session name cannot be passed to zellij (empty, or starts
+    /// with `-` and would be taken for an option).
+    BadSession(String),
     /// The terminal connection or `zellij attach` could not be started.
     Open(OpenError),
     /// The host was removed while opening.
@@ -104,6 +120,10 @@ impl fmt::Display for TermError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoHost => f.write_str("no such host"),
+            Self::BadSession(name) => write!(
+                f,
+                "invalid session name {name:?}: it must not be empty or start with '-'"
+            ),
             Self::Open(OpenError::Retry(m)) => write!(f, "terminal connection failed: {m}"),
             Self::Open(OpenError::NeedsUser(p)) => write!(f, "{p}"),
             Self::Stopped => f.write_str("host removed"),
@@ -112,6 +132,14 @@ impl fmt::Display for TermError {
 }
 
 impl std::error::Error for TermError {}
+
+/// Session names zellij would misread are refused up front.
+pub fn check_session(name: &str) -> Result<(), TermError> {
+    if name.is_empty() || name.starts_with('-') {
+        return Err(TermError::BadSession(name.to_owned()));
+    }
+    Ok(())
+}
 
 pub type OpenResult = Result<(u64, UnboundedReceiver<TermEvent>), TermError>;
 
@@ -147,6 +175,9 @@ struct Slot {
     pty: Option<UnboundedSender<PtyIn>>,
     /// Bumped on every attach, so output of an older PTY is ignored.
     generation: u64,
+    attached_at: Instant,
+    /// Channel closes in a row that came soon after attaching.
+    quick_ends: u32,
 }
 
 /// Output of one PTY, tagged with its terminal and attach generation;
@@ -157,8 +188,14 @@ enum Link<T> {
     /// No terminals, no connection.
     Idle,
     Up(T),
-    /// Lost; reconnect at the instant (or on `Retry` if `None`).
-    Down(Option<Instant>),
+    /// Lent to an attach that is under way.
+    Busy,
+    /// Lost; reconnect at `at` (or on `Retry` if `None`). `error` is why,
+    /// for terminals opened meanwhile.
+    Down {
+        at: Option<Instant>,
+        error: OpenError,
+    },
 }
 
 struct Terms<C: Connector> {
@@ -166,11 +203,23 @@ struct Terms<C: Connector> {
     connector: Arc<C>,
     zellij: ZellijPaths,
     events: UnboundedSender<(String, HostEvent)>,
+    cmds: UnboundedReceiver<TermCmd>,
     link: Link<C::Terminals>,
     slots: HashMap<u64, Slot>,
+    /// Opens that arrived while connecting or attaching.
+    pending: VecDeque<(AttachSpec, oneshot::Sender<OpenResult>)>,
     next_id: u64,
     backoff: Backoff,
+    /// When the current connection came up.
+    up_since: Option<Instant>,
     out_tx: UnboundedSender<Tagged>,
+}
+
+fn reason_of(e: OpenError) -> String {
+    match e {
+        OpenError::Retry(m) => m,
+        OpenError::NeedsUser(p) => p.to_string(),
+    }
 }
 
 impl<C: Connector> Terms<C> {
@@ -187,19 +236,76 @@ impl<C: Connector> Terms<C> {
         })
     }
 
+    /// A command that does not need the connection.
+    fn local(&mut self, cmd: TermCmd) {
+        match cmd {
+            TermCmd::Input { id, data } => {
+                if let Some(pty) = self.slots.get(&id).and_then(|s| s.pty.as_ref()) {
+                    let _ = pty.send(PtyIn::Data(data));
+                }
+            }
+            TermCmd::Resize { id, size } => {
+                if let Some(slot) = self.slots.get_mut(&id) {
+                    slot.spec.size = size;
+                    if let Some(pty) = &slot.pty {
+                        let _ = pty.send(PtyIn::Resize(size));
+                    }
+                }
+            }
+            TermCmd::Close { id } => {
+                if let Some(pty) = self.slots.remove(&id).and_then(|s| s.pty) {
+                    let _ = pty.send(PtyIn::Close);
+                }
+            }
+            TermCmd::Open { spec, reply } => self.pending.push_back((spec, reply)),
+            TermCmd::Retry | TermCmd::Stop => {}
+        }
+    }
+
+    /// Run `fut` (connecting or attaching) while handling commands that do
+    /// not need the connection; `None` if told to stop. `Retry` is ignored:
+    /// an attempt is under way.
+    async fn busy<F: Future>(&mut self, fut: F) -> Option<F::Output> {
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                out = &mut fut => return Some(out),
+                cmd = self.cmds.recv() => match cmd {
+                    None | Some(TermCmd::Stop) => return None,
+                    Some(cmd) => self.local(cmd),
+                },
+            }
+        }
+    }
+
     /// Attach `spec` over the current connection and start forwarding its
-    /// output.
+    /// output; `None` if told to stop meanwhile.
     async fn attach(
         &mut self,
         id: u64,
         generation: u64,
         spec: &AttachSpec,
-    ) -> Result<UnboundedSender<PtyIn>, OpenError> {
+    ) -> Option<Result<UnboundedSender<PtyIn>, OpenError>> {
         let zellij = self.zellij_path();
-        let Link::Up(t) = &mut self.link else {
-            return Err(OpenError::Retry("terminal connection is down".into()));
+        let mut t = match std::mem::replace(&mut self.link, Link::Busy) {
+            Link::Up(t) => t,
+            other => {
+                self.link = other;
+                return Some(Err(OpenError::Retry("terminal connection is down".into())));
+            }
         };
-        let PtyIo { input, mut output } = t.attach(zellij.as_deref(), spec).await?;
+        let spec = spec.clone();
+        let (t, r) = self
+            .busy(async move {
+                let r = t.attach(zellij.as_deref(), &spec).await;
+                (t, r)
+            })
+            .await?;
+        self.link = Link::Up(t);
+        let PtyIo { input, mut output } = match r {
+            Ok(io) => io,
+            Err(e) => return Some(Err(e)),
+        };
         let tx = self.out_tx.clone();
         tokio::spawn(async move {
             while let Some(o) = output.recv().await {
@@ -209,45 +315,58 @@ impl<C: Connector> Terms<C> {
             }
             let _ = tx.send((id, generation, None));
         });
-        Ok(input)
+        Some(Ok(input))
     }
 
-    async fn connect(&mut self) -> Result<(), OpenError> {
-        let t = self.connector.open_terminals(&self.cfg).await?;
-        self.link = Link::Up(t);
-        self.emit(Some(ConnState::Up));
-        Ok(())
+    /// Open the connection; `None` if told to stop meanwhile.
+    async fn connect(&mut self) -> Option<Result<(), OpenError>> {
+        let (connector, cfg) = (self.connector.clone(), self.cfg.clone());
+        let r = self
+            .busy(async move { connector.open_terminals(&cfg).await })
+            .await?;
+        Some(r.map(|t| {
+            self.link = Link::Up(t);
+            self.up_since = Some(Instant::now());
+            self.emit(Some(ConnState::Up));
+        }))
     }
 
     /// Drop the connection when the last terminal is gone.
     fn idle_if_empty(&mut self) {
-        if self.slots.is_empty() && !matches!(self.link, Link::Idle) {
+        if self.slots.is_empty() && !matches!(self.link, Link::Idle | Link::Busy) {
             self.link = Link::Idle;
+            self.up_since = None;
             self.backoff.reset();
             self.emit(None);
         }
     }
 
-    async fn open(&mut self, spec: AttachSpec) -> OpenResult {
-        if matches!(self.link, Link::Down(_)) {
-            // Detached terminals exist: reconnect and reattach them all, or
-            // they would stay detached once the link is up again.
-            self.reconnect().await;
-            if !matches!(self.link, Link::Up(_)) {
-                return Err(TermError::Open(OpenError::Retry(
-                    "terminal connection is down".into(),
-                )));
+    /// `None` if told to stop meanwhile.
+    async fn open(&mut self, spec: AttachSpec) -> Option<OpenResult> {
+        match self.link {
+            Link::Down { .. } => {
+                // Detached terminals exist: reconnect and reattach them all,
+                // or they would stay detached once the link is up again.
+                if !self.reconnect().await {
+                    return None;
+                }
+                if let Link::Down { error, .. } = &self.link {
+                    return Some(Err(TermError::Open(error.clone())));
+                }
             }
-        } else if matches!(self.link, Link::Idle)
-            && let Err(e) = self.connect().await
-        {
-            self.link = Link::Idle;
-            self.emit(None);
-            return Err(TermError::Open(e));
+            Link::Idle => match self.connect().await? {
+                Ok(()) => {}
+                Err(e) => {
+                    self.link = Link::Idle;
+                    self.emit(None);
+                    return Some(Err(TermError::Open(e)));
+                }
+            },
+            Link::Up(_) | Link::Busy => {}
         }
         let id = self.next_id;
         self.next_id += 1;
-        match self.attach(id, 0, &spec).await {
+        match self.attach(id, 0, &spec).await? {
             Ok(pty) => {
                 let (tx, rx) = mpsc::unbounded_channel();
                 let _ = tx.send(TermEvent::Attached);
@@ -258,19 +377,22 @@ impl<C: Connector> Terms<C> {
                         events: tx,
                         pty: Some(pty),
                         generation: 0,
+                        attached_at: Instant::now(),
+                        quick_ends: 0,
                     },
                 );
-                Ok((id, rx))
+                Some(Ok((id, rx)))
             }
             Err(e) => {
                 self.idle_if_empty();
-                Err(TermError::Open(e))
+                Some(Err(TermError::Open(e)))
             }
         }
     }
 
     /// The connection is gone: detach every terminal and schedule a
-    /// reconnect.
+    /// reconnect. The backoff starts over only if the connection had
+    /// stayed up for `STABLE_AFTER`.
     fn lost(&mut self, reason: String) {
         for slot in self.slots.values_mut() {
             slot.pty = None;
@@ -278,26 +400,43 @@ impl<C: Connector> Terms<C> {
                 reason: reason.clone(),
             });
         }
+        if self
+            .up_since
+            .take()
+            .is_some_and(|t| t.elapsed() >= STABLE_AFTER)
+        {
+            self.backoff.reset();
+        }
         let retry_in = self.backoff.next_delay();
-        self.link = Link::Down(Some(Instant::now() + retry_in));
+        self.link = Link::Down {
+            at: Some(Instant::now() + retry_in),
+            error: OpenError::Retry(reason.clone()),
+        };
         self.emit(Some(ConnState::Retrying { retry_in, reason }));
     }
 
-    /// Reconnect and attach every terminal again.
-    async fn reconnect(&mut self) {
-        if let Err(e) = self.connect().await {
-            match e {
-                OpenError::Retry(reason) => {
-                    let retry_in = self.backoff.next_delay();
-                    self.link = Link::Down(Some(Instant::now() + retry_in));
-                    self.emit(Some(ConnState::Retrying { retry_in, reason }));
-                }
-                OpenError::NeedsUser(p) => {
-                    self.link = Link::Down(None);
-                    self.emit(Some(ConnState::NeedsUser(p)));
-                }
+    /// Reconnect and attach every terminal again; false if told to stop.
+    async fn reconnect(&mut self) -> bool {
+        match self.connect().await {
+            None => return false,
+            Some(Ok(())) => {}
+            Some(Err(OpenError::Retry(reason))) => {
+                let retry_in = self.backoff.next_delay();
+                self.link = Link::Down {
+                    at: Some(Instant::now() + retry_in),
+                    error: OpenError::Retry(reason.clone()),
+                };
+                self.emit(Some(ConnState::Retrying { retry_in, reason }));
+                return true;
             }
-            return;
+            Some(Err(OpenError::NeedsUser(p))) => {
+                self.link = Link::Down {
+                    at: None,
+                    error: OpenError::NeedsUser(p.clone()),
+                };
+                self.emit(Some(ConnState::NeedsUser(p)));
+                return true;
+            }
         }
         let ids: Vec<u64> = self.slots.keys().copied().collect();
         for id in ids {
@@ -306,31 +445,83 @@ impl<C: Connector> Terms<C> {
             };
             let (spec, generation) = (slot.spec.clone(), slot.generation + 1);
             match self.attach(id, generation, &spec).await {
-                Ok(pty) => {
-                    if let Some(slot) = self.slots.get_mut(&id) {
+                None => return false,
+                Some(Ok(pty)) => match self.slots.get_mut(&id) {
+                    Some(slot) => {
                         slot.pty = Some(pty);
                         slot.generation = generation;
+                        slot.attached_at = Instant::now();
                         let _ = slot.events.send(TermEvent::Attached);
                     }
-                }
-                Err(e) => {
-                    let reason = match e {
-                        OpenError::Retry(m) => m,
-                        OpenError::NeedsUser(p) => p.to_string(),
-                    };
-                    return self.lost(reason);
+                    // Closed while attaching.
+                    None => {
+                        let _ = pty.send(PtyIn::Close);
+                    }
+                },
+                Some(Err(e)) => {
+                    self.lost(reason_of(e));
+                    return true;
                 }
             }
         }
-        self.backoff.reset();
+        self.idle_if_empty();
+        true
     }
 
-    fn output(&mut self, (id, generation, out): Tagged) {
+    /// One terminal's channel closed without an exit status while the
+    /// connection is up: attach that terminal again, unless its channel
+    /// keeps closing right after attaching. False if told to stop.
+    async fn channel_ended(&mut self, id: u64) -> bool {
+        let Some(slot) = self.slots.get_mut(&id) else {
+            return true;
+        };
+        slot.pty = None;
+        slot.quick_ends = if slot.attached_at.elapsed() < STABLE_AFTER {
+            slot.quick_ends + 1
+        } else {
+            0
+        };
+        if slot.quick_ends >= MAX_QUICK_ENDS {
+            let _ = slot.events.send(TermEvent::Exited(None));
+            self.slots.remove(&id);
+            self.idle_if_empty();
+            return true;
+        }
+        let _ = slot.events.send(TermEvent::Detached {
+            reason: "terminal channel closed".into(),
+        });
+        let (spec, generation) = (slot.spec.clone(), slot.generation + 1);
+        match self.attach(id, generation, &spec).await {
+            None => false,
+            Some(Ok(pty)) => {
+                match self.slots.get_mut(&id) {
+                    Some(slot) => {
+                        slot.pty = Some(pty);
+                        slot.generation = generation;
+                        slot.attached_at = Instant::now();
+                        let _ = slot.events.send(TermEvent::Attached);
+                    }
+                    None => {
+                        let _ = pty.send(PtyIn::Close);
+                    }
+                }
+                self.idle_if_empty();
+                true
+            }
+            Some(Err(e)) => {
+                self.lost(reason_of(e));
+                true
+            }
+        }
+    }
+
+    /// False if told to stop.
+    async fn output(&mut self, (id, generation, out): Tagged) -> bool {
         let Some(slot) = self.slots.get(&id) else {
-            return;
+            return true;
         };
         if slot.generation != generation || slot.pty.is_none() {
-            return;
+            return true;
         }
         match out {
             Some(PtyOut::Data(d)) => {
@@ -341,51 +532,48 @@ impl<C: Connector> Terms<C> {
                 self.slots.remove(&id);
                 self.idle_if_empty();
             }
-            None => self.lost("connection lost".into()),
+            None => {
+                if matches!(&self.link, Link::Up(t) if t.alive()) {
+                    return self.channel_ended(id).await;
+                }
+                self.lost("connection lost".into());
+            }
         }
+        true
     }
 
     /// Handle one command; false when the task should end.
     async fn command(&mut self, cmd: Option<TermCmd>) -> bool {
         match cmd {
-            None | Some(TermCmd::Stop) => {
-                for slot in self.slots.values() {
-                    if let Some(pty) = &slot.pty {
-                        let _ = pty.send(PtyIn::Close);
-                    }
+            None | Some(TermCmd::Stop) => false,
+            Some(TermCmd::Open { spec, reply }) => match self.open(spec).await {
+                Some(r) => {
+                    let _ = reply.send(r);
+                    true
                 }
-                return false;
-            }
-            Some(TermCmd::Open { spec, reply }) => {
-                let r = self.open(spec).await;
-                let _ = reply.send(r);
-            }
-            Some(TermCmd::Input { id, data }) => {
-                if let Some(pty) = self.slots.get(&id).and_then(|s| s.pty.as_ref()) {
-                    let _ = pty.send(PtyIn::Data(data));
-                }
-            }
-            Some(TermCmd::Resize { id, size }) => {
-                if let Some(slot) = self.slots.get_mut(&id) {
-                    slot.spec.size = size;
-                    if let Some(pty) = &slot.pty {
-                        let _ = pty.send(PtyIn::Resize(size));
-                    }
-                }
-            }
-            Some(TermCmd::Close { id }) => {
-                if let Some(pty) = self.slots.remove(&id).and_then(|s| s.pty) {
-                    let _ = pty.send(PtyIn::Close);
-                }
-                self.idle_if_empty();
-            }
+                None => false,
+            },
             Some(TermCmd::Retry) => {
-                if matches!(self.link, Link::Down(_)) {
-                    self.reconnect().await;
+                if matches!(self.link, Link::Down { .. }) {
+                    return self.reconnect().await;
                 }
+                true
+            }
+            Some(cmd) => {
+                self.local(cmd);
+                self.idle_if_empty();
+                true
             }
         }
-        true
+    }
+
+    /// Close every PTY (the task is ending).
+    fn close_all(&self) {
+        for slot in self.slots.values() {
+            if let Some(pty) = &slot.pty {
+                let _ = pty.send(PtyIn::Close);
+            }
+        }
     }
 }
 
@@ -396,7 +584,7 @@ pub async fn run_terms<C: Connector>(
     connector: Arc<C>,
     zellij: ZellijPaths,
     events: UnboundedSender<(String, HostEvent)>,
-    mut cmds: UnboundedReceiver<TermCmd>,
+    cmds: UnboundedReceiver<TermCmd>,
 ) {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let mut t = Terms {
@@ -404,26 +592,39 @@ pub async fn run_terms<C: Connector>(
         connector,
         zellij,
         events,
+        cmds,
         link: Link::Idle,
         slots: HashMap::new(),
+        pending: VecDeque::new(),
         next_id: 1,
         backoff: Backoff::default(),
+        up_since: None,
         out_tx,
     };
     loop {
-        let retry_at = match t.link {
-            Link::Down(Some(at)) if !t.slots.is_empty() => Some(at),
-            _ => None,
-        };
-        let sleep = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now));
-        tokio::select! {
-            cmd = cmds.recv() => {
-                if !t.command(cmd).await {
-                    return;
+        let go_on = if let Some((spec, reply)) = t.pending.pop_front() {
+            match t.open(spec).await {
+                Some(r) => {
+                    let _ = reply.send(r);
+                    true
                 }
+                None => false,
             }
-            Some(out) = out_rx.recv() => t.output(out),
-            _ = sleep, if retry_at.is_some() => t.reconnect().await,
+        } else {
+            let retry_at = match t.link {
+                Link::Down { at: Some(at), .. } if !t.slots.is_empty() => Some(at),
+                _ => None,
+            };
+            let sleep = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now));
+            tokio::select! {
+                cmd = t.cmds.recv() => t.command(cmd).await,
+                Some(out) = out_rx.recv() => t.output(out).await,
+                _ = sleep, if retry_at.is_some() => t.reconnect().await,
+            }
+        };
+        if !go_on {
+            t.close_all();
+            return;
         }
     }
 }

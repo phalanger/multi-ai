@@ -60,4 +60,11 @@ impl<P: Prompter> TermTransport for SystemTerminals<P> {
             }
         }
     }
+
+    fn alive(&self) -> bool {
+        match self {
+            Self::Ssh { session, .. } => !session.is_closed(),
+            Self::Local => true,
+        }
+    }
 }

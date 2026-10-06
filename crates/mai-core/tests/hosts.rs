@@ -97,6 +97,10 @@ impl TermTransport for ScriptedTerms {
         });
         Ok(io)
     }
+
+    fn alive(&self) -> bool {
+        true
+    }
 }
 
 /// Replays `steps` in order; hangs once they run out.
@@ -656,4 +660,16 @@ async fn connect_notes_are_reported_after_hello() {
         ])
     );
     assert_eq!(h.event().await, HostEvent::Probe(ConnState::Up));
+}
+
+/// B31: a session name zellij would take for an option is refused before
+/// anything is opened.
+#[tokio::test(start_paused = true)]
+async fn session_names_starting_with_a_dash_are_refused() {
+    let (c, _probes) = Scripted::new(vec![]);
+    let (mut mgr, _rx) = HostManager::start(c.clone(), TrackerConfig::default());
+    mgr.add_host(cfg("h"));
+    let size = TermSize { cols: 80, rows: 24 };
+    let r = mgr.open_terminal("h", "--help", false, size).await;
+    assert_eq!(r.err(), Some(TermError::BadSession("--help".into())));
 }

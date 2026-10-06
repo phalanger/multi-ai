@@ -3,18 +3,18 @@
 //! instantly.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mai_core::deploy::{Os, Remote, Shell};
 use mai_core::host::{
-    ConnState, Connector, HostConfig, HostEvent, HostKind, OpenError, Opened, Problem,
+    ConnState, Connector, HostConfig, HostEvent, HostKind, OpenError, Opened, Problem, STABLE_AFTER,
 };
 use mai_core::pty::{PtyEnds, PtyIn, PtyIo, PtyOut, TermSize, pty_channels};
 use mai_core::term::{
-    AttachSpec, OpenResult, TermCmd, TermError, TermEvent, TermTransport, ZellijPaths, attach_argv,
-    remote_attach_command, run_terms,
+    AttachSpec, MAX_QUICK_ENDS, OpenResult, TermCmd, TermError, TermEvent, TermTransport,
+    ZellijPaths, attach_argv, check_session, remote_attach_command, run_terms,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -35,6 +35,16 @@ fn remote(os: Os, shell: Shell) -> Remote {
 fn attach_arguments() {
     assert_eq!(attach_argv("work", false), vec!["attach", "work"]);
     assert_eq!(attach_argv("new", true), vec!["attach", "--create", "new"]);
+}
+
+#[test]
+fn session_names_zellij_would_misread_are_refused() {
+    assert!(check_session("work").is_ok());
+    assert!(check_session("a-b").is_ok());
+    assert_eq!(check_session("-h"), Err(TermError::BadSession("-h".into())));
+    assert_eq!(check_session(""), Err(TermError::BadSession(String::new())));
+    let msg = TermError::BadSession("--create".into()).to_string();
+    assert!(msg.contains("start with '-'"), "{msg}");
 }
 
 #[test]
@@ -75,6 +85,7 @@ struct Attached {
 
 struct FakeTerms {
     attaches: UnboundedSender<Attached>,
+    alive: Arc<AtomicBool>,
 }
 
 impl TermTransport for FakeTerms {
@@ -92,13 +103,21 @@ impl TermTransport for FakeTerms {
         self.attaches.send(a).unwrap();
         Ok(io)
     }
+
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
 }
 
-/// `open_terminals` fails with the queued errors first, then succeeds.
+/// `open_terminals` waits for `gate`, then fails with the queued errors
+/// first, then succeeds.
 struct FakeConnector {
     failures: Mutex<VecDeque<OpenError>>,
     opens: AtomicUsize,
     attaches: UnboundedSender<Attached>,
+    /// Liveness of the latest connection.
+    alive: Mutex<Arc<AtomicBool>>,
+    gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Connector for FakeConnector {
@@ -109,12 +128,16 @@ impl Connector for FakeConnector {
     }
 
     async fn open_terminals(&self, _host: &HostConfig) -> Result<FakeTerms, OpenError> {
+        drop(self.gate.lock().await);
         self.opens.fetch_add(1, Ordering::SeqCst);
         if let Some(e) = self.failures.lock().unwrap().pop_front() {
             return Err(e);
         }
+        let alive = Arc::new(AtomicBool::new(true));
+        *self.alive.lock().unwrap() = alive.clone();
         Ok(FakeTerms {
             attaches: self.attaches.clone(),
+            alive,
         })
     }
 }
@@ -125,6 +148,7 @@ struct Harness {
     events: UnboundedReceiver<(String, HostEvent)>,
     attaches: UnboundedReceiver<Attached>,
     zellij: ZellijPaths,
+    task: tokio::task::JoinHandle<()>,
 }
 
 fn start(zellij_cfg: Option<&str>, failures: Vec<OpenError>) -> Harness {
@@ -133,6 +157,8 @@ fn start(zellij_cfg: Option<&str>, failures: Vec<OpenError>) -> Harness {
         failures: Mutex::new(failures.into()),
         opens: AtomicUsize::new(0),
         attaches: attach_tx,
+        alive: Mutex::new(Arc::new(AtomicBool::new(true))),
+        gate: Arc::default(),
     });
     let (ev_tx, events) = mpsc::unbounded_channel();
     let (cmds, cmd_rx) = mpsc::unbounded_channel();
@@ -142,7 +168,7 @@ fn start(zellij_cfg: Option<&str>, failures: Vec<OpenError>) -> Harness {
         kind: HostKind::Local,
         zellij: zellij_cfg.map(str::to_owned),
     };
-    tokio::spawn(run_terms(
+    let task = tokio::spawn(run_terms(
         cfg,
         connector.clone(),
         zellij.clone(),
@@ -155,19 +181,29 @@ fn start(zellij_cfg: Option<&str>, failures: Vec<OpenError>) -> Harness {
         events,
         attaches,
         zellij,
+        task,
+    }
+}
+
+fn spec(session: &str) -> AttachSpec {
+    AttachSpec {
+        session: session.into(),
+        create: false,
+        size: SIZE,
     }
 }
 
 impl Harness {
-    async fn open(&self, session: &str) -> OpenResult {
+    /// Ask to open a terminal; the answer comes on the returned receiver.
+    fn request(&self, session: &str) -> oneshot::Receiver<OpenResult> {
         let (reply, answer) = oneshot::channel();
-        let spec = AttachSpec {
-            session: session.into(),
-            create: false,
-            size: SIZE,
-        };
+        let spec = spec(session);
         self.cmds.send(TermCmd::Open { spec, reply }).unwrap();
-        answer.await.unwrap()
+        answer
+    }
+
+    async fn open(&self, session: &str) -> OpenResult {
+        self.request(session).await.unwrap()
     }
 
     async fn attached(&mut self) -> Attached {
@@ -189,12 +225,30 @@ impl Harness {
             }
         }
     }
+
+    /// The connection drops: the transport reports itself dead and the
+    /// PTY output of `pty` ends without an exit status.
+    fn lose_connection(&self, pty: Attached) {
+        self.connector
+            .alive
+            .lock()
+            .unwrap()
+            .store(false, Ordering::SeqCst);
+        drop(pty.ends.output);
+    }
 }
 
 async fn next(rx: &mut UnboundedReceiver<TermEvent>) -> Option<TermEvent> {
     timeout(Duration::from_secs(600), rx.recv())
         .await
         .expect("terminal event")
+}
+
+fn retry_in(s: Option<ConnState>) -> Duration {
+    match s {
+        Some(ConnState::Retrying { retry_in, .. }) => retry_in,
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -269,17 +323,12 @@ async fn lost_connection_detaches_then_reattaches_with_current_size() {
     };
     h.cmds.send(TermCmd::Resize { id, size: bigger }).unwrap();
 
-    drop(first.ends.output); // output ends without Exit: connection lost
+    h.lose_connection(first);
     match next(&mut rx).await {
         Some(TermEvent::Detached { reason }) => assert!(reason.contains("lost"), "{reason}"),
         other => panic!("{other:?}"),
     }
-    match h.state().await {
-        Some(ConnState::Retrying { retry_in, .. }) => {
-            assert_eq!(retry_in, Duration::from_secs(1));
-        }
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(retry_in(h.state().await), Duration::from_secs(1));
     assert_eq!(h.state().await, Some(ConnState::Up));
     let second = h.attached().await;
     assert_eq!(second.spec.session, "work");
@@ -341,7 +390,7 @@ async fn reconnect_needing_the_user_waits_for_retry() {
         .lock()
         .unwrap()
         .push_back(OpenError::NeedsUser(Problem::HostKeyRejected));
-    drop(first.ends.output);
+    h.lose_connection(first);
     assert!(matches!(h.state().await, Some(ConnState::Retrying { .. })));
     assert_eq!(
         h.state().await,
@@ -358,6 +407,109 @@ async fn reconnect_needing_the_user_waits_for_retry() {
     h.attached().await;
 }
 
+/// B27: one terminal's channel closing while the connection is fine
+/// reattaches that terminal only, over the same connection.
+#[tokio::test(start_paused = true)]
+async fn closed_channel_reattaches_only_that_terminal() {
+    let mut h = start(None, vec![]);
+    let (_a, mut rx_a) = h.open("a").await.unwrap();
+    h.state().await;
+    let pty_a = h.attached().await;
+    let (_b, mut rx_b) = h.open("b").await.unwrap();
+    let _pty_b = h.attached().await;
+    assert_eq!(next(&mut rx_a).await, Some(TermEvent::Attached));
+    assert_eq!(next(&mut rx_b).await, Some(TermEvent::Attached));
+
+    drop(pty_a.ends.output); // channel closed, connection still alive
+    assert_eq!(
+        next(&mut rx_a).await,
+        Some(TermEvent::Detached {
+            reason: "terminal channel closed".into()
+        })
+    );
+    assert_eq!(h.attached().await.spec.session, "a");
+    assert_eq!(next(&mut rx_a).await, Some(TermEvent::Attached));
+    assert_eq!(
+        h.connector.opens.load(Ordering::SeqCst),
+        1,
+        "same connection"
+    );
+    assert!(rx_b.try_recv().is_err(), "the other terminal is untouched");
+}
+
+#[tokio::test(start_paused = true)]
+async fn channel_that_keeps_closing_ends_the_terminal() {
+    let mut h = start(None, vec![]);
+    let (_id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    assert_eq!(next(&mut rx).await, Some(TermEvent::Attached));
+    for _ in 1..MAX_QUICK_ENDS {
+        drop(h.attached().await.ends.output);
+        assert!(matches!(
+            next(&mut rx).await,
+            Some(TermEvent::Detached { .. })
+        ));
+        assert_eq!(next(&mut rx).await, Some(TermEvent::Attached));
+    }
+    drop(h.attached().await.ends.output);
+    assert_eq!(next(&mut rx).await, Some(TermEvent::Exited(None)));
+    assert_eq!(next(&mut rx).await, None);
+    assert_eq!(h.state().await, None, "last terminal closes the connection");
+}
+
+/// B27: the backoff only starts over after the connection stayed up for
+/// `STABLE_AFTER`, so a connection that drops right after every reconnect
+/// does not reconnect every second.
+#[tokio::test(start_paused = true)]
+async fn backoff_starts_over_only_after_a_stable_connection() {
+    let mut h = start(None, vec![]);
+    let (_id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    let pty = h.attached().await;
+    next(&mut rx).await;
+
+    h.lose_connection(pty);
+    assert_eq!(retry_in(h.state().await), Duration::from_secs(1));
+    assert_eq!(h.state().await, Some(ConnState::Up));
+    let pty = h.attached().await;
+    h.lose_connection(pty);
+    assert_eq!(retry_in(h.state().await), Duration::from_secs(2));
+    assert_eq!(h.state().await, Some(ConnState::Up));
+    let pty = h.attached().await;
+
+    tokio::time::sleep(STABLE_AFTER).await;
+    h.lose_connection(pty);
+    assert_eq!(retry_in(h.state().await), Duration::from_secs(1));
+}
+
+/// B27: opening a terminal while the connection is down reports why it is
+/// down, not just that it is.
+#[tokio::test(start_paused = true)]
+async fn opening_while_down_reports_the_real_reason() {
+    let mut h = start(None, vec![]);
+    let (_id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    let first = h.attached().await;
+    next(&mut rx).await;
+    {
+        let mut failures = h.connector.failures.lock().unwrap();
+        failures.push_back(OpenError::NeedsUser(Problem::HostKeyRejected));
+        failures.push_back(OpenError::NeedsUser(Problem::HostKeyRejected));
+    }
+    h.lose_connection(first);
+    h.state().await; // Retrying
+    assert_eq!(
+        h.state().await,
+        Some(ConnState::NeedsUser(Problem::HostKeyRejected))
+    );
+    assert_eq!(
+        h.open("logs").await.err(),
+        Some(TermError::Open(OpenError::NeedsUser(
+            Problem::HostKeyRejected
+        )))
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn opening_a_terminal_while_detached_reattaches_the_others() {
     let mut h = start(None, vec![]);
@@ -366,7 +518,7 @@ async fn opening_a_terminal_while_detached_reattaches_the_others() {
     let first = h.attached().await;
     assert_eq!(next(&mut rx).await, Some(TermEvent::Attached));
 
-    drop(first.ends.output);
+    h.lose_connection(first);
     assert!(matches!(
         next(&mut rx).await,
         Some(TermEvent::Detached { .. })
@@ -379,4 +531,67 @@ async fn opening_a_terminal_while_detached_reattaches_the_others() {
     let mut sessions = vec![a.spec.session, b.spec.session];
     sessions.sort();
     assert_eq!(sessions, vec!["logs", "work"]);
+}
+
+/// B28: while the connection is being made (e.g. a host-key prompt is
+/// open), closing a detached terminal takes effect at once and it is not
+/// attached again afterwards.
+#[tokio::test(start_paused = true)]
+async fn close_is_handled_while_reconnecting() {
+    let mut h = start(None, vec![]);
+    let (id, mut rx) = h.open("work").await.unwrap();
+    h.state().await;
+    let first = h.attached().await;
+    next(&mut rx).await;
+
+    let hold = h.connector.gate.clone().lock_owned().await;
+    h.lose_connection(first);
+    h.state().await; // Retrying
+    tokio::time::sleep(Duration::from_secs(2)).await; // reconnect is waiting
+    h.cmds.send(TermCmd::Close { id }).unwrap();
+    assert!(matches!(
+        next(&mut rx).await,
+        Some(TermEvent::Detached { .. })
+    ));
+    assert_eq!(next(&mut rx).await, None, "closed while reconnecting");
+    drop(hold);
+    assert_eq!(h.state().await, Some(ConnState::Up));
+    assert_eq!(h.state().await, None, "nothing left to attach");
+    assert!(h.attaches.try_recv().is_err());
+}
+
+/// B28: stop ends the task even while it waits for the connection; the
+/// pending open is answered with an error.
+#[tokio::test(start_paused = true)]
+async fn stop_ends_the_task_while_connecting() {
+    let h = start(None, vec![]);
+    let hold = h.connector.gate.clone().lock_owned().await;
+    let answer = h.request("work");
+    let queued = h.request("logs");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    h.cmds.send(TermCmd::Stop).unwrap();
+    timeout(Duration::from_secs(60), h.task)
+        .await
+        .expect("task ended")
+        .unwrap();
+    assert!(answer.await.is_err(), "open answered by dropping it");
+    assert!(queued.await.is_err());
+    drop(hold);
+}
+
+/// B28: an open that arrives while another is connecting waits its turn
+/// and uses the same connection.
+#[tokio::test(start_paused = true)]
+async fn open_during_connect_waits_its_turn() {
+    let mut h = start(None, vec![]);
+    let hold = h.connector.gate.clone().lock_owned().await;
+    let first = h.request("work");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let second = h.request("logs");
+    drop(hold);
+    assert!(first.await.unwrap().is_ok());
+    assert!(second.await.unwrap().is_ok());
+    assert_eq!(h.attached().await.spec.session, "work");
+    assert_eq!(h.attached().await.spec.session, "logs");
+    assert_eq!(h.connector.opens.load(Ordering::SeqCst), 1);
 }

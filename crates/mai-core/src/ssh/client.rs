@@ -677,6 +677,11 @@ impl<P: Prompter> SshSession<P> {
         &self.notes
     }
 
+    /// Whether the connection is gone (the session task has ended).
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
+
     /// Run `command` to completion, collecting stdout, stderr and status.
     pub async fn exec(&self, command: &str) -> Result<ExecOutput, SshError> {
         let mut ch = self.handle.channel_open_session().await.map_err(chan_err)?;
